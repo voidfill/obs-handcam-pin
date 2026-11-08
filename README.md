@@ -107,8 +107,11 @@ active.
 
 ## Building from source
 
-Only the vendored libobs headers are needed (`vendor/libobs`, from OBS 31.1.2;
-re-vendor with `scripts/vendor-obs-headers.sh <tag>`). No OBS install, SDK or CMake.
+Only the libobs headers are needed, with no OBS install, SDK or CMake. They are not
+committed: on the first build, `build.sh` downloads them for the OBS release pinned
+in [`OBS_VERSION`](OBS_VERSION) (currently 31.1.2) into the gitignored `vendor/`
+folder, so the first build needs `git` and internet. To build against another OBS
+release, change `OBS_VERSION`; the next build fetches the matching headers.
 
 ```bash
 ./build.sh            # build into dist/stage/

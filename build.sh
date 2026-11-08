@@ -7,7 +7,8 @@
 #
 # Env: VERSION (default: contents of ./VERSION), CC, ZIG, ARCHS (macOS).
 # Nothing links against libobs at build time except the Windows import library,
-# which is generated from windows/obs.def. Only the vendored headers are needed.
+# which is generated from windows/obs.def. Only the libobs headers are needed;
+# they are downloaded automatically for the version in ./OBS_VERSION.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -17,6 +18,13 @@ VERSION="${VERSION#v}"
 BUILD=build
 DIST=dist
 CMD="${1:-build}"
+
+# libobs headers are not committed: fetch them for the pinned OBS release on
+# first build (or when OBS_VERSION changes). Needs git + network once.
+OBS_TAG="$(tr -d '[:space:]' < OBS_VERSION)"
+if [ "$(cat vendor/libobs/OBS_VERSION 2>/dev/null)" != "$OBS_TAG" ]; then
+  scripts/fetch-obs-headers.sh "$OBS_TAG"
+fi
 
 rm -rf "$BUILD" "$DIST"
 mkdir -p "$BUILD" "$DIST"
