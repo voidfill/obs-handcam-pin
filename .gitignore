@@ -1,0 +1,6 @@
+/build/
+/dist/
+/.claude/
+*.o
+*.obj
+.DS_Store

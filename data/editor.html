@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handcam Pin Editor</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #2a2c33; --line: #3a3d46; --text: #e6e7ea; --muted: #9aa0ab;
+    --accent: #4fa3ff; --warn: #ff6b5a; --ok: #43c47a; --handle: #ffd04a;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; min-height: 100%; }
+  header, .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  .bar.bottom { border-top: 1px solid var(--line); border-bottom: 0; }
+  label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+  input, select, button { font: inherit; color: var(--text); background: #1a1b20; border: 1px solid var(--line);
+    border-radius: 4px; padding: 4px 6px; min-height: 26px; }
+  input[type=text], input[type=password] { width: 9em; }
+  input.narrow { width: 4.5em; }
+  select#source { max-width: 16em; }
+  input[type=checkbox] { min-height: 0; }
+  button { cursor: pointer; background: #353842; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b1220; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  .grow { flex: 1 1 auto; }
+  #status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  #status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #status.ok::before { background: var(--ok); }
+  #status.err::before { background: var(--warn); }
+  #status.busy::before { background: var(--handle); }
+  details summary { cursor: pointer; color: var(--muted); }
+  #stage { flex: 1 1 auto; min-height: 200px; display: flex; flex-direction: row; overflow: hidden; }
+  #stage.stacked { flex-direction: column; }
+  .pane { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+  #editPane { flex: 3 1 0; }
+  #previewPane { flex: 2 1 0; border-left: 1px solid var(--line); background: #111216; }
+  #stage.stacked #previewPane { border-left: 0; border-top: 1px solid var(--line); }
+  #preview { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .paneLabel { position: absolute; left: 6px; top: 4px; padding: 1px 6px; border-radius: 3px; font-size: 11px;
+    background: rgba(0,0,0,0.55); color: var(--muted); pointer-events: none; }
+  .paneLabel.live::before { content: "● "; color: var(--warn); }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; cursor: crosshair; }
+  #msg { position: absolute; left: 0; right: 0; bottom: 8px; text-align: center; pointer-events: none; color: var(--muted); }
+  #msg.warn { color: var(--warn); }
+  #readout { font: 12px ui-monospace, Consolas, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 2px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <span id="status">disconnected</span>
+  <details id="conn">
+    <summary>Connection</summary>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+      <label>Host <input id="host" type="text" value="127.0.0.1"></label>
+      <label>Port <input id="port" class="narrow" type="text" value="4455"></label>
+      <label>Password <input id="password" type="password" autocomplete="off"></label>
+      <label title="Stored only in this browser's local storage"><input id="remember" type="checkbox" checked> remember</label>
+    </div>
+  </details>
+  <button id="connectBtn">Connect</button>
+  <span class="sep"></span>
+  <label>Source <select id="source" disabled><option>— connect first —</option></select></label>
+  <button id="refreshBtn" title="Refresh the source list" disabled>↻</button>
+  <button id="addBtn" class="hidden" title="Add a Handcam Pin filter to this source">Add filter</button>
+  <button id="grabBtn" class="primary" disabled>Grab frame</button>
+</header>
+
+<div id="stage">
+  <div id="editPane" class="pane">
+    <canvas id="cv" tabindex="0"></canvas>
+    <div id="rawLabel" class="paneLabel">Raw frame — not grabbed yet</div>
+    <div id="msg">Connect to OBS, then grab a frame. Drag the corners onto your mousepad.</div>
+  </div>
+  <div id="previewPane" class="pane">
+    <img id="preview" alt="">
+    <div id="previewLabel" class="paneLabel">Output preview</div>
+  </div>
+</div>
+
+<div class="bar bottom">
+  <button id="rotBtn" title="Cycle corners: TL←BL←BR←TR">Rotate 90°</button>
+  <button id="mirBtn" title="Swap left and right corners">Mirror</button>
+  <button id="resetBtn">Reset</button>
+  <label><input id="grid" type="checkbox" checked> grid</label>
+  <label title="Show OBS's filtered output next to the editor"><input id="previewOn" type="checkbox" checked> preview</label>
+  <span class="grow"></span>
+  <span id="readout"></span>
+</div>
+
+<script>
+"use strict";
+/* ======================================================================
+   Handcam Pin editor. Talks obs-websocket v5 and writes the filter's
+   eight corner settings (tl_x ... bl_y). The plugin does the math.
+   ====================================================================== */
+
+const FILTER_KIND = "handcam_pin";
+const KEYS = ["tl_x", "tl_y", "tr_x", "tr_y", "br_x", "br_y", "bl_x", "bl_y"];
+const DEFAULTS = [0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9];
+const LABELS = ["TL", "TR", "BR", "BL"];
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------------- storage (per-viewer convenience only) ---------------- */
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("handcam-pin." + k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("handcam-pin." + k, v); } catch {} },
+  del(k) { try { localStorage.removeItem("handcam-pin." + k); } catch {} },
+};
+
+/* ---------------- SHA-256 (works without a secure context) ---------------- */
+function sha256(bytes) {
+  const K = new Uint32Array([
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const len = bytes.length, total = ((len + 9 + 63) >> 6) << 6;
+  const m = new Uint8Array(total); m.set(bytes); m[len] = 0x80;
+  const dv = new DataView(m.buffer);
+  dv.setUint32(total - 4, (len * 8) >>> 0); dv.setUint32(total - 8, Math.floor(len / 0x20000000));
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >>> 3);
+      const s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 8; i++) new DataView(out.buffer).setUint32(i * 4, H[i]);
+  return out;
+}
+const b64 = (u8) => btoa(String.fromCharCode(...u8));
+const b64sha = (s) => b64(sha256(new TextEncoder().encode(s)));
+
+/* ---------------- minimal obs-websocket v5 client ---------------- */
+class Obs {
+  constructor() { this.ws = null; this.pending = new Map(); this.seq = 0; this.onclose = null; this.onevent = null; }
+  connect(url, password) {
+    return new Promise((resolve, reject) => {
+      let ws;
+      try { ws = new WebSocket(url, "obswebsocket.json"); } catch (e) { reject(e); return; }
+      this.ws = ws;
+      let identified = false;
+      ws.onmessage = (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        const d = msg.d || {};
+        if (msg.op === 0) {
+          // Inputs (1<<3) + Filters (1<<5): keep the source list and corners in sync.
+          const ident = { rpcVersion: 1, eventSubscriptions: (1 << 3) | (1 << 5) };
+          if (d.authentication) {
+            if (!password) { reject(new Error("OBS requires a password")); ws.close(); return; }
+            ident.authentication = b64sha(b64sha(password + d.authentication.salt) + d.authentication.challenge);
+          }
+          ws.send(JSON.stringify({ op: 1, d: ident }));
+        } else if (msg.op === 2) {
+          identified = true; resolve();
+        } else if (msg.op === 5) {
+          if (this.onevent) try { this.onevent(d.eventType, d.eventData || {}); } catch (e) { console.error(e); }
+        } else if (msg.op === 7) {
+          const p = this.pending.get(d.requestId);
+          if (!p) return;
+          this.pending.delete(d.requestId);
+          if (d.requestStatus && d.requestStatus.result) p.resolve(d.responseData || {});
+          else p.reject(new Error(`${d.requestType}: ${(d.requestStatus && d.requestStatus.comment) || "failed (code " + (d.requestStatus && d.requestStatus.code) + ")"}`));
+        }
+      };
+      ws.onerror = () => { if (!identified) reject(new Error("cannot reach obs-websocket at " + url)); };
+      ws.onclose = (ev) => {
+        for (const p of this.pending.values()) p.reject(new Error("connection closed"));
+        this.pending.clear();
+        if (!identified) reject(new Error(ev.code === 4009 ? "wrong password" : `connection closed (${ev.code})`));
+        else if (this.onclose) this.onclose(ev);
+        this.ws = null;
+      };
+    });
+  }
+  get connected() { return !!this.ws && this.ws.readyState === 1; }
+  call(requestType, requestData = {}) {
+    if (!this.connected) return Promise.reject(new Error("not connected"));
+    const requestId = "r" + (++this.seq);
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      this.ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, requestData } }));
+    });
+  }
+  close() { if (this.ws) { this.onclose = null; this.ws.close(); } }
+}
+
+/* ---------------- geometry ---------------- */
+// Heckbert square-to-quad: maps (0,0),(1,0),(1,1),(0,1) -> TL,TR,BR,BL.
+function homography(q) {
+  const [x0, y0, x1, y1, x2, y2, x3, y3] = q;
+  const dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+  const dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+  if (Math.abs(dx3) < 1e-12 && Math.abs(dy3) < 1e-12)
+    return [x1 - x0, x2 - x1, x0, y1 - y0, y2 - y1, y0, 0, 0, 1];
+  const det = dx1 * dy2 - dx2 * dy1;
+  if (Math.abs(det) < 1e-12) return null;
+  const g = (dx3 * dy2 - dx2 * dy3) / det, h = (dx1 * dy3 - dx3 * dy1) / det;
+  return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h, 1];
+}
+function applyH(H, u, v) {
+  const w = H[6] * u + H[7] * v + H[8];
+  return [(H[0] * u + H[1] * v + H[2]) / w, (H[3] * u + H[4] * v + H[5]) / w];
+}
+function isConvex(q) {
+  let sign = 0, area = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = 2 * i, b = 2 * ((i + 1) % 4), c = 2 * ((i + 2) % 4);
+    const cr = (q[b] - q[a]) * (q[c + 1] - q[b + 1]) - (q[b + 1] - q[a + 1]) * (q[c] - q[b]);
+    if (Math.abs(cr) < 1e-9) return false;
+    const s = cr > 0 ? 1 : -1;
+    if (sign && s !== sign) return false;
+    sign = s; area += q[a] * q[b + 1] - q[b] * q[a + 1];
+  }
+  return Math.abs(area) > 1e-6;
+}
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+/* ---------------- state ---------------- */
+const obs = new Obs();
+let corners = DEFAULTS.slice();
+let img = null;                 // grabbed frame
+let imgW = 1920, imgH = 1080;   // source size (for nudge step + aspect)
+let target = null;              // { source, filter }
+let selected = -1;              // 0..3 handle, 4 = whole quad, -1 none
+let drag = null;
+let reconnectTimer = null, wantConnected = false;
+
+const cv = $("cv"), ctx = cv.getContext("2d");
+const PAD = 18;
+
+function setStatus(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; }
+function setMsg(text, warn) { const m = $("msg"); m.textContent = text || ""; m.className = warn ? "warn" : ""; }
+
+/* ---------------- view transform ---------------- */
+function viewRect() {
+  const W = cv.clientWidth, Hh = cv.clientHeight;
+  const aw = W - 2 * PAD, ah = Hh - 2 * PAD;
+  const s = Math.min(aw / imgW, ah / imgH);
+  const w = imgW * s, h = imgH * s;
+  return { x: (W - w) / 2, y: (Hh - h) / 2, w, h };
+}
+const toView = (r, u, v) => [r.x + u * r.w, r.y + v * r.h];
+const fromView = (r, x, y) => [(x - r.x) / r.w, (y - r.y) / r.h];
+
+/* ---------------- drawing ---------------- */
+function resize() {
+  // Side by side when wide, stacked when tall (e.g. a narrow OBS dock).
+  const st = $("stage");
+  st.classList.toggle("stacked", st.clientWidth < st.clientHeight * 1.3);
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(cv.clientWidth * dpr)), h = Math.max(1, Math.round(cv.clientHeight * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  draw();
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
+  const r = viewRect();
+
+  if (img) ctx.drawImage(img, r.x, r.y, r.w, r.h);
+  else { ctx.fillStyle = "#14151a"; ctx.fillRect(r.x, r.y, r.w, r.h); }
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 1; ctx.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+
+  const pts = [0, 1, 2, 3].map((i) => toView(r, corners[2 * i], corners[2 * i + 1]));
+  const valid = isConvex(corners);
+
+  // dim outside the quad
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.moveTo(...pts[0]); ctx.lineTo(...pts[1]); ctx.lineTo(...pts[2]); ctx.lineTo(...pts[3]); ctx.closePath();
+  ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fill("evenodd");
+  ctx.restore();
+
+  // perspective grid
+  const H = valid ? homography(corners) : null;
+  if (H && $("grid").checked) {
+    ctx.strokeStyle = "rgba(79,163,255,0.55)"; ctx.lineWidth = 1;
+    ctx.beginPath();
+    const N = 8;
+    for (let i = 1; i < N; i++) {
+      const t = i / N;
+      let a = toView(r, ...applyH(H, t, 0)), b = toView(r, ...applyH(H, t, 1));
+      ctx.moveTo(...a); ctx.lineTo(...b);
+      a = toView(r, ...applyH(H, 0, t)); b = toView(r, ...applyH(H, 1, t));
+      ctx.moveTo(...a); ctx.lineTo(...b);
+    }
+    ctx.stroke();
+  }
+
+  // outline; top edge (output top) highlighted
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = valid ? "#4fa3ff" : "#ff6b5a";
+  ctx.beginPath(); ctx.moveTo(...pts[1]); ctx.lineTo(...pts[2]); ctx.lineTo(...pts[3]); ctx.lineTo(...pts[0]); ctx.stroke();
+  ctx.lineWidth = 4; ctx.strokeStyle = valid ? "#43c47a" : "#ff6b5a";
+  ctx.beginPath(); ctx.moveTo(...pts[0]); ctx.lineTo(...pts[1]); ctx.stroke();
+
+  // handles
+  ctx.font = "bold 11px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  pts.forEach((p, i) => {
+    const sel = selected === i || selected === 4;
+    ctx.beginPath(); ctx.arc(p[0], p[1], sel ? 9 : 7, 0, Math.PI * 2);
+    ctx.fillStyle = sel ? "#ffd04a" : "rgba(255,208,74,0.85)"; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = "#111"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(p[0], p[1], 1.5, 0, Math.PI * 2); ctx.fillStyle = "#111"; ctx.fill();
+    // label pushed away from quad center
+    const cx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4, cy = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
+    let dx = p[0] - cx, dy = p[1] - cy; const dl = Math.hypot(dx, dy) || 1;
+    const lx = p[0] + dx / dl * 20, ly = p[1] + dy / dl * 20;
+    ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(lx - 12, ly - 8, 24, 16);
+    ctx.fillStyle = "#fff"; ctx.fillText(LABELS[i], lx, ly);
+  });
+
+  // loupe while dragging a single corner
+  if (drag && drag.kind === "corner" && img) drawLoupe(r, pts[drag.index], drag.index);
+
+  $("readout").textContent = LABELS.map((l, i) =>
+    `${l} ${(corners[2 * i] * imgW).toFixed(0)},${(corners[2 * i + 1] * imgH).toFixed(0)}`).join("  ");
+  if (!valid) setMsg(CONVEX_MSG, true);
+  else if ($("msg").textContent === CONVEX_MSG) setMsg("");
+}
+const CONVEX_MSG = "Quad must be convex — the filter keeps its last valid shape.";
+
+function drawLoupe(r, p, idx) {
+  const R = 60, Z = 4;
+  let lx = p[0] + (idx === 1 || idx === 2 ? -R - 24 : R + 24), ly = p[1] + (idx >= 2 ? -R - 24 : R + 24);
+  lx = Math.min(cv.clientWidth - R - 4, Math.max(R + 4, lx));
+  ly = Math.min(cv.clientHeight - R - 4, Math.max(R + 4, ly));
+  const sx = (p[0] - r.x) / r.w * img.naturalWidth, sy = (p[1] - r.y) / r.h * img.naturalHeight;
+  const half = R / Z * (img.naturalWidth / r.w);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(lx, ly, R, 0, Math.PI * 2); ctx.clip();
+  ctx.fillStyle = "#000"; ctx.fillRect(lx - R, ly - R, 2 * R, 2 * R);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, sx - half, sy - half, 2 * half, 2 * half, lx - R, ly - R, 2 * R, 2 * R);
+  ctx.strokeStyle = "#ffd04a"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(lx - R, ly); ctx.lineTo(lx + R, ly); ctx.moveTo(lx, ly - R); ctx.lineTo(lx, ly + R); ctx.stroke();
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(lx, ly, R, 0, Math.PI * 2); ctx.lineWidth = 2; ctx.strokeStyle = "#ffd04a"; ctx.stroke();
+}
+
+/* ---------------- pushing corners (coalesced) ---------------- */
+let inflight = false, dirty = false;
+function pushCorners() {
+  dirty = true;
+  if (!inflight) flush();
+}
+async function flush() {
+  if (!dirty || !target || !obs.connected) return;
+  dirty = false;
+  if (!isConvex(corners)) return;
+  inflight = true;
+  const filterSettings = {};
+  KEYS.forEach((k, i) => (filterSettings[k] = Math.round(corners[i] * 1e6) / 1e6));
+  try {
+    lastPush = performance.now();
+    await obs.call("SetSourceFilterSettings",
+      { sourceName: target.source, filterName: target.filter, filterSettings, overlay: true });
+  } catch (e) { setMsg(e.message, true); }
+  finally { lastPush = performance.now(); inflight = false; if (dirty) flush(); }
+}
+
+/* ---------------- interaction ---------------- */
+function pointerPos(ev) { const b = cv.getBoundingClientRect(); return [ev.clientX - b.left, ev.clientY - b.top]; }
+function pointInQuad(x, y, pts) {
+  let inside = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const [xi, yi] = pts[i], [xj, yj] = pts[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+cv.addEventListener("pointerdown", (ev) => {
+  cv.focus();
+  const r = viewRect(), [x, y] = pointerPos(ev);
+  const pts = [0, 1, 2, 3].map((i) => toView(r, corners[2 * i], corners[2 * i + 1]));
+  let best = -1, bd = 16;
+  pts.forEach((p, i) => { const d = Math.hypot(p[0] - x, p[1] - y); if (d < bd) { bd = d; best = i; } });
+  if (best >= 0) {
+    selected = best;
+    const [u, v] = fromView(r, x, y);
+    drag = { kind: "corner", index: best, du: corners[2 * best] - u, dv: corners[2 * best + 1] - v };
+  } else if (pointInQuad(x, y, pts)) {
+    selected = 4;
+    drag = { kind: "all", start: fromView(r, x, y), orig: corners.slice() };
+    cv.style.cursor = "grabbing";
+  } else {
+    selected = -1; drag = null;
+  }
+  if (drag) cv.setPointerCapture(ev.pointerId);
+  draw();
+});
+
+cv.addEventListener("pointermove", (ev) => {
+  const r = viewRect(), [x, y] = pointerPos(ev);
+  if (!drag) {
+    const pts = [0, 1, 2, 3].map((i) => toView(r, corners[2 * i], corners[2 * i + 1]));
+    const near = pts.some((p) => Math.hypot(p[0] - x, p[1] - y) < 16);
+    cv.style.cursor = near ? "pointer" : pointInQuad(x, y, pts) ? "grab" : "crosshair";
+    return;
+  }
+  const [u, v] = fromView(r, x, y);
+  if (drag.kind === "corner") {
+    corners[2 * drag.index] = clamp01(u + drag.du);
+    corners[2 * drag.index + 1] = clamp01(v + drag.dv);
+  } else {
+    moveAll(drag.orig, u - drag.start[0], v - drag.start[1]);
+  }
+  draw();
+  pushCorners();
+});
+
+function endDrag(ev) {
+  if (!drag) return;
+  drag = null; cv.style.cursor = "crosshair";
+  try { cv.releasePointerCapture(ev.pointerId); } catch {}
+  draw();
+  pushCorners();
+}
+cv.addEventListener("pointerup", endDrag);
+cv.addEventListener("pointercancel", endDrag);
+
+function moveAll(orig, du, dv) {
+  const xs = [orig[0], orig[2], orig[4], orig[6]], ys = [orig[1], orig[3], orig[5], orig[7]];
+  du = Math.min(1 - Math.max(...xs), Math.max(-Math.min(...xs), du));
+  dv = Math.min(1 - Math.max(...ys), Math.max(-Math.min(...ys), dv));
+  for (let i = 0; i < 4; i++) { corners[2 * i] = orig[2 * i] + du; corners[2 * i + 1] = orig[2 * i + 1] + dv; }
+}
+
+window.addEventListener("keydown", (ev) => {
+  if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLSelectElement) return;
+  const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  if (dirs[ev.key]) {
+    if (selected < 0) selected = 4;
+    const step = ev.shiftKey ? 10 : ev.altKey ? 0.25 : 1; // source pixels
+    const du = dirs[ev.key][0] * step / imgW, dv = dirs[ev.key][1] * step / imgH;
+    if (selected === 4) moveAll(corners.slice(), du, dv);
+    else { corners[2 * selected] = clamp01(corners[2 * selected] + du); corners[2 * selected + 1] = clamp01(corners[2 * selected + 1] + dv); }
+    ev.preventDefault(); draw(); pushCorners();
+  } else if (ev.key === "Tab" && document.activeElement === cv) {
+    selected = ((selected < 0 || selected > 3 ? -1 : selected) + (ev.shiftKey ? 3 : 1)) % 4;
+    ev.preventDefault(); draw();
+  } else if (ev.key === "Escape") { selected = -1; draw(); }
+});
+
+/* ---------------- transforms ---------------- */
+function rotate() { const o = corners.slice(); corners = [o[6], o[7], o[0], o[1], o[2], o[3], o[4], o[5]]; draw(); pushCorners(); }
+function mirror() { const o = corners.slice(); corners = [o[2], o[3], o[0], o[1], o[6], o[7], o[4], o[5]]; draw(); pushCorners(); }
+function reset() { corners = DEFAULTS.slice(); draw(); pushCorners(); }
+$("rotBtn").onclick = rotate; $("mirBtn").onclick = mirror; $("resetBtn").onclick = reset;
+$("grid").onchange = draw;
+
+/* ---------------- OBS: discovery, corners, grab ---------------- */
+// Audio-only input kinds never make sense here; everything else is listed.
+const AUDIO_KIND = /^(wasapi_|pulse_|coreaudio_|alsa_|jack_|sndio_|oss_|decklink-captions)/;
+let sourceList = [];        // [{ source, filter|null, multi }]
+let preferred = null;       // { source, filter } to select after the next refresh
+let refreshing = null;
+
+// Rebuild the Source dropdown: inputs that have a Handcam Pin filter first
+// (one entry per filter), then other video inputs that could get one.
+function refreshSources(pref) {
+  if (pref) preferred = pref;
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    const { inputs } = await obs.call("GetInputList");
+    const entries = [];
+    await Promise.all(inputs.map(async (inp) => {
+      if (AUDIO_KIND.test(inp.unversionedInputKind || inp.inputKind || "")) return;
+      let pins = [];
+      try {
+        const { filters } = await obs.call("GetSourceFilterList", { sourceName: inp.inputName });
+        pins = filters.filter((f) => f.filterKind === FILTER_KIND).map((f) => f.filterName);
+      } catch {}
+      if (pins.length) for (const filter of pins) entries.push({ source: inp.inputName, filter, multi: pins.length > 1 });
+      else entries.push({ source: inp.inputName, filter: null });
+    }));
+    entries.sort((a, b) => (!a.filter - !b.filter) || a.source.localeCompare(b.source) || (a.filter || "").localeCompare(b.filter || ""));
+    sourceList = entries;
+
+    const sel = $("source");
+    sel.innerHTML = "";
+    const groups = [["With Handcam Pin", entries.filter((e) => e.filter)], ["Other sources — add the filter", entries.filter((e) => !e.filter)]];
+    for (const [label, list] of groups) {
+      if (!list.length) continue;
+      const g = document.createElement("optgroup"); g.label = label;
+      for (const e of list) {
+        const o = document.createElement("option");
+        o.value = String(entries.indexOf(e));
+        o.textContent = e.multi ? `${e.source} › ${e.filter}` : e.source;
+        g.appendChild(o);
+      }
+      sel.appendChild(g);
+    }
+    if (!entries.length) sel.innerHTML = "<option>(no video sources)</option>";
+    sel.disabled = !entries.length;
+
+    // Pick: preferred source/filter, else current target, else first with a filter, else first.
+    const want = preferred || target || {};
+    preferred = null;
+    const pick = entries.find((e) => e.source === want.source && e.filter && (!want.filter || e.filter === want.filter))
+      || entries.find((e) => e.source === want.source)
+      || entries.find((e) => e.filter) || entries[0];
+    if (pick) sel.value = String(entries.indexOf(pick));
+    await selectEntry(pick);
+  })().finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+async function selectEntry(e) {
+  $("addBtn").classList.toggle("hidden", !e || !!e.filter);
+  if (!e || !e.filter) {
+    target = null; img = null;
+    $("rawLabel").textContent = "Raw frame — not grabbed yet";
+    $("preview").removeAttribute("src");
+    setStatus("connected", "ok");
+    setMsg(e ? `"${e.source}" has no Handcam Pin filter yet — press "Add filter".` : "No video sources in OBS.", true);
+    draw();
+    return;
+  }
+  const changed = !target || target.source !== e.source || target.filter !== e.filter;
+  target = { source: e.source, filter: e.filter };
+  store.set("source", e.source); store.set("filter", e.filter);
+  setStatus(`connected · ${e.source}`, "ok");
+  if (changed) {
+    img = null;
+    setMsg("");
+    await grab();
+  }
+}
+
+$("source").onchange = () => selectEntry(sourceList[+$("source").value]).catch((e) => setMsg(e.message, true));
+$("refreshBtn").onclick = () => refreshSources().catch((e) => setMsg(e.message, true));
+$("addBtn").onclick = async () => {
+  const e = sourceList[+$("source").value];
+  if (!e || e.filter) return;
+  try {
+    const { filters } = await obs.call("GetSourceFilterList", { sourceName: e.source });
+    const names = new Set(filters.map((f) => f.filterName));
+    let name = "Handcam Pin";
+    for (let n = 2; names.has(name); n++) name = `Handcam Pin ${n}`;
+    await obs.call("CreateSourceFilter", { sourceName: e.source, filterName: name, filterKind: FILTER_KIND });
+    await refreshSources({ source: e.source, filter: name });
+  } catch (err) { setMsg(err.message, true); }
+};
+
+// Keep the list (and our target) in sync with changes made in OBS.
+let listTimer = null;
+const LIST_EVENTS = new Set(["InputCreated", "InputRemoved", "InputNameChanged",
+  "SourceFilterCreated", "SourceFilterRemoved", "SourceFilterNameChanged"]);
+let defaultsCache = null;
+let lastPush = 0;
+function onObsEvent(type, d) {
+  if (type === "InputNameChanged" && target && d.oldInputName === target.source) target.source = d.inputName;
+  if (type === "SourceFilterNameChanged" && target && d.sourceName === target.source && d.oldFilterName === target.filter) target.filter = d.filterName;
+  if (LIST_EVENTS.has(type)) {
+    clearTimeout(listTimer);
+    listTimer = setTimeout(() => refreshSources().catch(() => {}), 250);
+  }
+  if (type === "SourceFilterSettingsChanged" && target && d.sourceName === target.source && d.filterName === target.filter)
+    adoptRemoteSettings(d.filterSettings, performance.now());
+}
+
+// Corners changed in OBS (sliders, Rotate/Mirror/Reset in the filter dialog):
+// follow them, unless we're editing or it could be an echo of our own push.
+const editingNow = () => drag || inflight || dirty || grabbing || performance.now() - lastPush < 400;
+function adoptRemoteSettings(settings, issuedAt) {
+  if (editingNow() || issuedAt < lastPush) return;
+  const s = Object.assign({}, defaultsCache || {}, settings);
+  const next = KEYS.map((k, i) => (typeof s[k] === "number" ? s[k] : corners[i]));
+  if (next.some((v, i) => Math.abs(v - corners[i]) > 1e-6)) { corners = next; draw(); }
+}
+
+// OBS doesn't emit a settings-changed event for these updates, so poll (cheap).
+setInterval(async () => {
+  if (!target || !obs.connected || document.hidden || editingNow()) return;
+  const issuedAt = performance.now(), t = target;
+  try {
+    const { filterSettings } = await obs.call("GetSourceFilter", { sourceName: t.source, filterName: t.filter });
+    if (target === t) adoptRemoteSettings(filterSettings, issuedAt);
+  } catch {}
+}, 500);
+
+async function loadCorners() {
+  if (!target) return;
+  const [{ filterSettings }, { defaultFilterSettings }] = await Promise.all([
+    obs.call("GetSourceFilter", { sourceName: target.source, filterName: target.filter }),
+    obs.call("GetSourceFilterDefaultSettings", { filterKind: FILTER_KIND }),
+  ]);
+  defaultsCache = defaultFilterSettings;
+  const s = Object.assign({}, defaultFilterSettings, filterSettings);
+  corners = KEYS.map((k, i) => (typeof s[k] === "number" ? s[k] : DEFAULTS[i]));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function grab() {
+  if (!target) throw new Error("Pick a source with a Handcam Pin filter first.");
+  $("grabBtn").disabled = true;
+  setStatus("grabbing…", "busy");
+  const reenable = [];
+  // Keep the output preview from capturing while our filter is switched off.
+  grabbing = true;
+  await previewInflight;
+  try {
+    await loadCorners();
+    const { filters } = await obs.call("GetSourceFilterList", { sourceName: target.source });
+    const ours = filters.find((f) => f.filterName === target.filter);
+    // Disable our filter and everything after it, so the frame is exactly our input.
+    for (const f of filters) {
+      if (f.filterIndex >= ours.filterIndex && f.filterEnabled) {
+        await obs.call("SetSourceFilterEnabled", { sourceName: target.source, filterName: f.filterName, filterEnabled: false });
+        reenable.push(f.filterName);
+      }
+    }
+    await sleep(80);
+    const { imageData } = await obs.call("GetSourceScreenshot", { sourceName: target.source, imageFormat: "png" });
+    const im = new Image();
+    await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error("could not decode screenshot")); im.src = imageData; });
+    img = im; imgW = im.naturalWidth; imgH = im.naturalHeight;
+    $("rawLabel").textContent = `Raw frame · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
+    setMsg("");
+  } finally {
+    grabbing = false;
+    for (const name of reenable) {
+      try { await obs.call("SetSourceFilterEnabled", { sourceName: target.source, filterName: name, filterEnabled: true }); }
+      catch (e) { setMsg(`Could not re-enable "${name}": ${e.message}`, true); }
+    }
+    $("grabBtn").disabled = !obs.connected;
+    setStatus(`connected · ${target.source}`, "ok");
+    draw();
+  }
+}
+$("grabBtn").onclick = () => grab().catch((e) => { setMsg(e.message, true); setStatus(obs.connected ? "connected" : "disconnected", obs.connected ? "ok" : "err"); });
+
+/* ---------------- live output preview ----------------
+   Polls the filtered source (what OBS actually outputs) so drags, rotate and
+   mirror are visible immediately. One request in flight at a time. */
+const PREVIEW_INTERVAL = 100; // ms between frames (~10 fps)
+let grabbing = false, previewInflight = Promise.resolve(), previewTimer = null, previewFails = 0;
+
+function schedulePreview(ms) { clearTimeout(previewTimer); previewTimer = setTimeout(previewTick, ms); }
+
+function previewTick() {
+  const on = $("previewOn").checked;
+  $("previewPane").classList.toggle("hidden", !on);
+  if (!on || !obs.connected || !target || grabbing || document.hidden) {
+    $("previewLabel").classList.remove("live");
+    schedulePreview(400);
+    return;
+  }
+  const t0 = performance.now();
+  const pane = $("previewPane");
+  const width = Math.max(64, Math.min(1280, Math.round(pane.clientWidth * (window.devicePixelRatio || 1))));
+  previewInflight = obs.call("GetSourceScreenshot",
+    { sourceName: target.source, imageFormat: "jpg", imageWidth: width, imageCompressionQuality: 80 })
+    .then(({ imageData }) => {
+      if (!grabbing) $("preview").src = imageData;
+      previewFails = 0;
+      $("previewLabel").textContent = "Output (live)";
+      $("previewLabel").classList.add("live");
+    })
+    .catch((e) => {
+      previewFails++;
+      $("previewLabel").textContent = "Output preview: " + e.message;
+      $("previewLabel").classList.remove("live");
+    })
+    .finally(() => {
+      const backoff = previewFails ? Math.min(3000, 250 * previewFails) : 0;
+      schedulePreview(Math.max(0, PREVIEW_INTERVAL - (performance.now() - t0)) + backoff);
+    });
+}
+$("previewOn").onchange = () => { $("previewPane").classList.toggle("hidden", !$("previewOn").checked); store.set("preview", $("previewOn").checked ? "1" : "0"); resize(); schedulePreview(0); };
+document.addEventListener("visibilitychange", () => { if (!document.hidden) schedulePreview(0); });
+
+/* ---------------- connection ---------------- */
+obs.onevent = onObsEvent;
+async function afterConnect() {
+  try {
+    // After a reconnect, re-grab even if the same source is picked again.
+    const pref = target || preferred;
+    target = null;
+    await refreshSources(pref);
+  } catch (e) {
+    setStatus("connected", "ok");
+    setMsg(e.message, true);
+  }
+}
+
+async function connect() {
+  clearTimeout(reconnectTimer);
+  const host = $("host").value.trim() || "127.0.0.1", port = $("port").value.trim() || "4455";
+  const password = $("password").value;
+  store.set("host", host); store.set("port", port);
+  if ($("remember").checked) store.set("password", password); else store.del("password");
+  store.set("remember", $("remember").checked ? "1" : "0");
+  obs.close();
+  setStatus("connecting…", "busy");
+  try {
+    await obs.connect(`ws://${host}:${port}`, password);
+  } catch (e) {
+    setStatus(e.message, "err");
+    if (/password/.test(e.message)) { $("conn").open = true; wantConnected = false; }
+    else if (wantConnected) reconnectTimer = setTimeout(connect, 3000);
+    updateButtons();
+    return;
+  }
+  wantConnected = true;
+  $("conn").open = false;
+  obs.onclose = () => {
+    setStatus("disconnected — retrying", "err"); updateButtons();
+    if (wantConnected) reconnectTimer = setTimeout(connect, 3000);
+  };
+  updateButtons();
+  await afterConnect();
+}
+function updateButtons() {
+  const c = obs.connected;
+  $("grabBtn").disabled = !c; $("refreshBtn").disabled = !c;
+  if (!c) $("source").disabled = true;
+  $("connectBtn").textContent = c ? "Reconnect" : "Connect";
+}
+$("connectBtn").onclick = () => { wantConnected = true; connect(); };
+for (const id of ["host", "port", "password"])
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") { wantConnected = true; connect(); } });
+
+/* ---------------- init ---------------- */
+(function init() {
+  const q = new URLSearchParams(location.search);
+  $("host").value = q.get("host") || store.get("host", "127.0.0.1");
+  $("port").value = q.get("port") || store.get("port", "4455");
+  $("remember").checked = store.get("remember", "1") === "1";
+  $("password").value = q.get("password") || store.get("password", "");
+  // Source to pick once the list loads: ?source=&filter= in the URL, else the last one used.
+  const src = q.get("source") || store.get("source", "");
+  if (src) preferred = { source: src, filter: q.get("filter") || (q.get("source") ? "" : store.get("filter", "")) };
+  $("previewOn").checked = store.get("preview", "1") === "1";
+  $("previewPane").classList.toggle("hidden", !$("previewOn").checked);
+  new ResizeObserver(resize).observe($("stage"));
+  new ResizeObserver(resize).observe(cv);
+  window.addEventListener("resize", resize);
+  resize();
+  schedulePreview(500);
+  // Auto-connect when we've connected before (or settings were passed in the URL).
+  if (q.has("password") || q.has("host") || store.get("host", null) !== null) { wantConnected = true; connect(); }
+  else $("conn").open = true;
+})();
+</script>
+</body>
+</html>

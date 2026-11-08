@@ -1,0 +1,43 @@
+; libobs exports used by handcam-pin. build.sh turns this into an import
+; library (obs.lib) so the Windows build needs no OBS SDK. If you call a new
+; libobs function, add it here (the link step will tell you which is missing).
+LIBRARY obs.dll
+EXPORTS
+	blog
+	bfree
+	bmalloc
+	gs_effect_create_from_file
+	gs_effect_destroy
+	gs_effect_get_param_by_name
+	gs_effect_set_vec3
+	obs_data_create
+	obs_data_get_double
+	obs_data_get_int
+	obs_data_release
+	obs_data_set_default_double
+	obs_data_set_default_int
+	obs_data_set_double
+	obs_enter_graphics
+	obs_filter_get_target
+	obs_find_module_file
+	obs_leave_graphics
+	obs_module_load_locale
+	obs_properties_add_button
+	obs_properties_add_float_slider
+	obs_properties_add_group
+	obs_properties_add_int
+	obs_properties_add_text
+	obs_properties_create
+	obs_property_int_set_suffix
+	obs_register_source_s
+	obs_source_get_base_height
+	obs_source_get_base_width
+	obs_source_get_name
+	obs_source_process_filter_begin
+	obs_source_process_filter_end
+	obs_source_skip_video_filter
+	obs_source_update
+	os_get_abs_path_ptr
+	os_utf8_to_wcs_ptr
+	text_lookup_destroy
+	text_lookup_getstr

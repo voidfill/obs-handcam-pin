@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-latest   # Apple Silicon; clang builds a universal (arm64 + x86_64) bundle
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (Windows only)
+        if: matrix.os == 'windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="$(cat VERSION)-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Build and package
+        run: ./build.sh package
+
+      - name: Check exported symbols
+        run: |
+          case "${{ matrix.os }}" in
+            linux)   nm -D --defined-only dist/stage/handcam-pin/bin/64bit/handcam-pin.so | grep -q obs_module_load ;;
+            macos)   nm -gU dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin | grep -q obs_module_load
+                     lipo -info dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin ;;
+            windows) grep -q obs_module_load dist/stage/obs-plugins/64bit/handcam-pin.dll ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: handcam-pin-${{ matrix.os }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

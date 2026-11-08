@@ -1,0 +1,65 @@
+// handcam-pin: perspective warp. The plugin uploads the 3x3 homography H
+// (unit square -> source uv) as three rows. For each output uv:
+//   src = H * (uv, 1);  src.xy /= src.z;  sample, transparent outside [0,1].
+// Only scalar comparisons are used so it translates to both HLSL and GLSL.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float3 h_row0;
+uniform float3 h_row1;
+uniform float3 h_row2;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSPin(VertData v_in) : TARGET
+{
+	float3 p = float3(v_in.uv.x, v_in.uv.y, 1.0);
+	float w  = dot(h_row2, p);
+	float ws = max(w, 0.000001);
+	float sx = dot(h_row0, p) / ws;
+	float sy = dot(h_row1, p) / ws;
+
+	// Sample unconditionally (uniform control flow for derivatives), then mask.
+	float4 color = image.Sample(textureSampler, float2(sx, sy));
+
+	float inside = 1.0;
+	if (w <= 0.000001)
+		inside = 0.0;
+	if (sx < 0.0)
+		inside = 0.0;
+	if (sx > 1.0)
+		inside = 0.0;
+	if (sy < 0.0)
+		inside = 0.0;
+	if (sy > 1.0)
+		inside = 0.0;
+
+	return color * inside;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPin(v_in);
+	}
+}
