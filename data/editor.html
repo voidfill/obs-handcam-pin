@@ -64,9 +64,9 @@
       <label>Port <input id="port" class="narrow" type="text" value="4455"></label>
       <label>Password <input id="password" type="password" autocomplete="off"></label>
       <label title="Stored only in this browser's local storage"><input id="remember" type="checkbox" checked> remember</label>
+      <button id="connectBtn">Connect</button>
     </div>
   </details>
-  <button id="connectBtn">Connect</button>
   <span class="sep"></span>
   <label>Source <select id="source" disabled><option>— connect first —</option></select></label>
   <button id="refreshBtn" title="Refresh the source list" disabled>↻</button>
@@ -119,6 +119,11 @@ const FILTER_KIND = "handcam_pin";
 const KEYS = ["tl_x", "tl_y", "tr_x", "tr_y", "br_x", "br_y", "bl_x", "bl_y"];
 const DEFAULTS = [0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9];
 const LABELS = ["TL", "TR", "BR", "BL"];
+// The plugin writes a copy of this file into OBS's plugin_config folder with
+// obs-websocket's port and password filled in here ({port, password}).
+// That copy is what the auto-added dock and "Open editor" use.
+const INJECTED = /*HANDCAM_PIN_CONFIG*/null;
+const WS_OFF_MSG = "Can't reach OBS. Turn on its WebSocket server: Tools → WebSocket Server Settings → Enable WebSocket server. The editor connects by itself once it's on.";
 
 const $ = (id) => document.getElementById(id);
 
@@ -203,11 +208,12 @@ class Obs {
       };
       ws.onerror = () => { if (!identified) reject(new Error("cannot reach obs-websocket at " + url)); };
       ws.onclose = (ev) => {
+        if (!identified) reject(new Error(ev.code === 4009 ? "wrong password" : `connection closed (${ev.code})`));
+        if (this.ws !== ws) return; // replaced by a newer connection
         for (const p of this.pending.values()) p.reject(new Error("connection closed"));
         this.pending.clear();
-        if (!identified) reject(new Error(ev.code === 4009 ? "wrong password" : `connection closed (${ev.code})`));
-        else if (this.onclose) this.onclose(ev);
         this.ws = null;
+        if (identified && this.onclose) this.onclose(ev);
       };
     });
   }
@@ -262,7 +268,7 @@ let imgW = 1920, imgH = 1080;   // source size (for nudge step + aspect)
 let target = null;              // { source, filter }
 let selected = -1;              // 0..3 handle, 4 = whole quad, -1 none
 let drag = null;
-let reconnectTimer = null, wantConnected = false;
+let retryTimer = null, attempt = 0;
 
 const cv = $("cv"), ctx = cv.getContext("2d");
 const PAD = 18;
@@ -554,7 +560,6 @@ async function selectEntry(e) {
     target = null; img = null;
     $("rawLabel").textContent = "Raw frame — not grabbed yet";
     $("preview").removeAttribute("src");
-    setStatus("connected", "ok");
     setMsg(e ? `"${e.source}" has no Handcam Pin filter yet — press "Add filter".` : "No video sources in OBS.", true);
     draw();
     return;
@@ -562,7 +567,6 @@ async function selectEntry(e) {
   const changed = !target || target.source !== e.source || target.filter !== e.filter;
   target = { source: e.source, filter: e.filter };
   store.set("source", e.source); store.set("filter", e.filter);
-  setStatus(`connected · ${e.source}`, "ok");
   if (changed) {
     img = null;
     setMsg("");
@@ -675,7 +679,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function grab() {
   if (!target) throw new Error("Pick a source with a Handcam Pin filter first.");
   $("grabBtn").disabled = true;
-  setStatus("grabbing…", "busy");
+  $("grabBtn").textContent = "Grabbing…";
   const reenable = [];
   // Keep the output preview from capturing while our filter is switched off.
   grabbing = true;
@@ -705,11 +709,11 @@ async function grab() {
       catch (e) { setMsg(`Could not re-enable "${name}": ${e.message}`, true); }
     }
     $("grabBtn").disabled = !obs.connected;
-    setStatus(`connected · ${target.source}`, "ok");
+    $("grabBtn").textContent = "Grab frame";
     draw();
   }
 }
-$("grabBtn").onclick = () => grab().catch((e) => { setMsg(e.message, true); setStatus(obs.connected ? "connected" : "disconnected", obs.connected ? "ok" : "err"); });
+$("grabBtn").onclick = () => grab().catch((e) => setMsg(e.message, true));
 
 /* ---------------- live output preview ----------------
    Polls the filtered source (what OBS actually outputs) so drags, rotate and
@@ -751,7 +755,10 @@ function previewTick() {
 $("previewOn").onchange = () => { $("previewPane").classList.toggle("hidden", !$("previewOn").checked); store.set("preview", $("previewOn").checked ? "1" : "0"); resize(); schedulePreview(0); };
 document.addEventListener("visibilitychange", () => { if (!document.hidden) schedulePreview(0); });
 
-/* ---------------- connection ---------------- */
+/* ---------------- connection ----------------
+   The editor keeps itself connected: it retries every 3 s until OBS answers,
+   and again whenever the connection drops. Only a password problem stops it;
+   then the Connection panel opens and Connect retries with the new details. */
 obs.onevent = onObsEvent;
 async function afterConnect() {
   try {
@@ -760,13 +767,14 @@ async function afterConnect() {
     target = null;
     await refreshSources(pref);
   } catch (e) {
-    setStatus("connected", "ok");
     setMsg(e.message, true);
   }
 }
 
+function retryLater() { clearTimeout(retryTimer); retryTimer = setTimeout(connect, 3000); }
+
 async function connect() {
-  clearTimeout(reconnectTimer);
+  clearTimeout(retryTimer);
   const host = $("host").value.trim() || "127.0.0.1", port = $("port").value.trim() || "4455";
   const password = $("password").value;
   store.set("host", host); store.set("port", port);
@@ -774,21 +782,27 @@ async function connect() {
   store.set("remember", $("remember").checked ? "1" : "0");
   obs.close();
   setStatus("connecting…", "busy");
+  const mine = ++attempt;
   try {
     await obs.connect(`ws://${host}:${port}`, password);
   } catch (e) {
-    setStatus(e.message, "err");
-    if (/password/.test(e.message)) { $("conn").open = true; wantConnected = false; }
-    else if (wantConnected) reconnectTimer = setTimeout(connect, 3000);
+    if (mine !== attempt) return; // a newer attempt took over
+    if (/password/.test(e.message)) {
+      setStatus(e.message, "err");
+      $("conn").open = true;
+    } else {
+      setStatus("can't reach OBS — retrying", "err");
+      if (/cannot reach/.test(e.message)) setMsg(WS_OFF_MSG, true);
+      retryLater();
+    }
     updateButtons();
     return;
   }
-  wantConnected = true;
+  if (mine !== attempt) return;
+  setStatus("connected", "ok");
   $("conn").open = false;
-  obs.onclose = () => {
-    setStatus("disconnected — retrying", "err"); updateButtons();
-    if (wantConnected) reconnectTimer = setTimeout(connect, 3000);
-  };
+  if ($("msg").textContent === WS_OFF_MSG) setMsg("");
+  obs.onclose = () => { setStatus("connection lost — retrying", "err"); updateButtons(); retryLater(); };
   updateButtons();
   await afterConnect();
 }
@@ -796,19 +810,19 @@ function updateButtons() {
   const c = obs.connected;
   $("grabBtn").disabled = !c; $("refreshBtn").disabled = !c; $("camBtn").disabled = !c;
   if (!c) $("source").disabled = true;
-  $("connectBtn").textContent = c ? "Reconnect" : "Connect";
 }
-$("connectBtn").onclick = () => { wantConnected = true; connect(); };
+$("connectBtn").onclick = connect;
 for (const id of ["host", "port", "password"])
-  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") { wantConnected = true; connect(); } });
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
 
 /* ---------------- init ---------------- */
 (function init() {
   const q = new URLSearchParams(location.search);
-  $("host").value = q.get("host") || store.get("host", "127.0.0.1");
-  $("port").value = q.get("port") || store.get("port", "4455");
+  // URL parameters win, then the details the plugin filled in, then the last ones used.
+  $("host").value = q.get("host") || (INJECTED ? "127.0.0.1" : store.get("host", "127.0.0.1"));
+  $("port").value = q.get("port") || (INJECTED ? String(INJECTED.port) : store.get("port", "4455"));
   $("remember").checked = store.get("remember", "1") === "1";
-  $("password").value = q.get("password") || store.get("password", "");
+  $("password").value = q.get("password") || (INJECTED ? INJECTED.password : store.get("password", ""));
   // Source to pick once the list loads: ?source=&filter= in the URL, else the last one used.
   const src = q.get("source") || store.get("source", "");
   if (src) preferred = { source: src, filter: q.get("filter") || (q.get("source") ? "" : store.get("filter", "")) };
@@ -819,9 +833,7 @@ for (const id of ["host", "port", "password"])
   window.addEventListener("resize", resize);
   resize();
   schedulePreview(500);
-  // Auto-connect when we've connected before (or settings were passed in the URL).
-  if (q.has("password") || q.has("host") || store.get("host", null) !== null) { wantConnected = true; connect(); }
-  else $("conn").open = true;
+  connect();
 })();
 </script>
 </body>

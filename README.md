@@ -75,12 +75,12 @@ that folder.
 
 1. **Add the filter.** Right-click your webcam source → *Filters* → **+** → *Handcam Pin*.
    (The editor can also add it for you, see step 3.)
-2. **Enable obs-websocket.** Go to *Tools → WebSocket Server Settings → Enable WebSocket
-   server*. Note the port (4455) and the password (*Show Connect Info*).
-3. **Open the editor.** Click *Open editor* in the filter's properties. It opens
-   `editor.html` in your browser. To keep it in OBS instead, copy the `file:///…`
-   URL shown under the button into *Docks → Custom Browser Docks*.
-   Enter the password under *Connection* and press **Connect**.
+2. **Turn on obs-websocket.** Tick *Tools → WebSocket Server Settings → Enable WebSocket
+   server*. That's all: you don't need to copy the password, the plugin passes it
+   to the editor.
+3. **Open the editor.** Click *Open editor* at the top of the filter's properties. It
+   opens in your browser and connects by itself. To keep it inside OBS instead, copy
+   the *Dock URL* shown below the button into *Docks → Custom Browser Docks*.
 4. **Pick the source** from the *Source* dropdown. Sources that already have the
    filter are listed first. For any other video source, press **Add filter**.
 5. **Grab a frame.** The editor takes one still, unfiltered frame from the camera
@@ -112,6 +112,14 @@ source in your scene. To keep its box fixed, right-click the source in the scene
 The thick green edge is the top of the output. Changes are sent to OBS while you
 drag, and changes made in OBS (sliders, the buttons in the filter dialog) appear in
 the editor within about half a second.
+
+**How the editor gets the connection details.** On every start, and when you press
+*Open editor*, the plugin writes a copy of `editor.html` into OBS's
+`plugin_config/handcam-pin/` folder with obs-websocket's port and password filled
+in. *Open editor* and the *Dock URL* use that copy, so a password change is picked
+up after the next OBS start. If the editor can't connect, it tells you to enable the
+WebSocket server and retries until you do. To connect to OBS on another computer,
+open the editor's *Connection* section and enter its address and password.
 
 You can pass settings in the URL, for example
 `editor.html?host=127.0.0.1&port=4455&source=Webcam&filter=Handcam%20Pin`.

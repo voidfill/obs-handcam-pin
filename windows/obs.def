@@ -6,25 +6,33 @@ EXPORTS
 	bfree
 	blog
 	bmalloc
+	dstr_copy
+	dstr_replace
 	gs_effect_create_from_file
 	gs_effect_destroy
 	gs_effect_get_param_by_name
 	gs_effect_set_vec3
 	obs_data_create
+	obs_data_create_from_json_file
 	obs_data_erase
+	obs_data_get_bool
 	obs_data_get_double
 	obs_data_get_int
+	obs_data_get_json
 	obs_data_get_string
 	obs_data_has_user_value
 	obs_data_release
 	obs_data_set_default_double
 	obs_data_set_default_string
 	obs_data_set_double
+	obs_data_set_int
 	obs_data_set_string
+	obs_data_unset_user_value
 	obs_enter_graphics
 	obs_filter_get_target
 	obs_find_module_file
 	obs_leave_graphics
+	obs_module_get_config_path
 	obs_module_load_locale
 	obs_properties_add_button
 	obs_properties_add_float
@@ -46,7 +54,11 @@ EXPORTS
 	obs_source_process_filter_end
 	obs_source_skip_video_filter
 	obs_source_update
+	os_file_exists
 	os_get_abs_path_ptr
+	os_mkdirs
+	os_quick_read_utf8_file
+	os_quick_write_utf8_file
 	os_utf8_to_wcs_ptr
 	text_lookup_destroy
 	text_lookup_getstr

@@ -9,6 +9,7 @@
 #include <sys/stat.h> /* before util/platform.h (declares os_stat) */
 
 #include <obs-module.h>
+#include <util/dstr.h>
 #include <util/platform.h>
 
 #include <math.h>
@@ -162,8 +163,18 @@ static const char *hp_get_name(void *unused)
 	return obs_module_text("HandcamPin");
 }
 
+static char *editor_path(void);
+static char *path_to_file_url(const char *path);
+
 static void hp_defaults(obs_data_t *settings)
 {
+	/* Shown in a text field so it can be copied (OBS info labels aren't selectable). */
+	char *path = editor_path();
+	char *url = path ? path_to_file_url(path) : NULL;
+	obs_data_set_default_string(settings, "editor_url", url ? url : "");
+	bfree(url);
+	bfree(path);
+
 	for (int i = 0; i < NUM_COORDS; i++)
 		obs_data_set_default_double(settings, corner_keys[i], default_corners[i]);
 	obs_data_set_default_string(settings, "shape", "pad");
@@ -221,6 +232,9 @@ static void hp_update(void *data, obs_data_t *settings)
 	struct handcam_pin *f = data;
 	double c[NUM_COORDS];
 	float h[9];
+
+	/* The URL field is for copying only: don't keep anything typed into it. */
+	obs_data_unset_user_value(settings, "editor_url");
 
 	for (int i = 0; i < NUM_COORDS; i++)
 		c[i] = obs_data_get_double(settings, corner_keys[i]);
@@ -382,10 +396,9 @@ static bool on_reset(obs_properties_t *props, obs_property_t *p, void *data)
 	return set_corners(data, default_corners);
 }
 
-/* Absolute filesystem path of the bundled editor (bfree the result). */
-static char *editor_path(void)
+/* Absolute path with forward slashes (takes ownership of rel, bfree the result). */
+static char *abs_slashes(char *rel)
 {
-	char *rel = obs_module_file("editor.html");
 	if (!rel)
 		return NULL;
 	char *abs = os_get_abs_path_ptr(rel);
@@ -397,6 +410,93 @@ static char *editor_path(void)
 		}
 	}
 	return abs;
+}
+
+/*
+ * The editor is a static HTML file, so it can't ask OBS for the websocket
+ * password. Instead we write a copy of it into our plugin_config folder with
+ * obs-websocket's current port/password filled in. "Open editor" and the
+ * dock URL point at that copy. It's regenerated on every OBS start and whenever "Open editor" is
+ * pressed, so password changes are picked up. The password is already stored
+ * in plain text in obs-websocket's config.json in the same folder tree.
+ */
+#define CONFIG_MARKER "/*HANDCAM_PIN_CONFIG*/null"
+
+static char *bundled_editor_path(void)
+{
+	return abs_slashes(obs_module_file("editor.html"));
+}
+
+static char *live_editor_path(void)
+{
+	return abs_slashes(obs_module_config_path("editor.html"));
+}
+
+/* JSON for the editor, or NULL if obs-websocket has no config yet. */
+static char *websocket_config_json(void)
+{
+	char *ws_path = obs_module_config_path("../obs-websocket/config.json");
+	obs_data_t *ws = ws_path ? obs_data_create_from_json_file(ws_path) : NULL;
+	bfree(ws_path);
+	if (!ws)
+		return NULL;
+
+	obs_data_t *out = obs_data_create();
+	obs_data_set_int(out, "port", obs_data_has_user_value(ws, "server_port") ? obs_data_get_int(ws, "server_port")
+										 : 4455);
+	bool auth = !obs_data_has_user_value(ws, "auth_required") || obs_data_get_bool(ws, "auth_required");
+	obs_data_set_string(out, "password", auth ? obs_data_get_string(ws, "server_password") : "");
+
+	/* Escape '<' so a password can't close the <script> it's embedded in. */
+	struct dstr json = {0};
+	dstr_copy(&json, obs_data_get_json(out));
+	dstr_replace(&json, "<", "\\u003c");
+	obs_data_release(out);
+	obs_data_release(ws);
+	return json.array;
+}
+
+/* Write the editor copy with connection details. Returns its path, or NULL. */
+static char *write_live_editor(void)
+{
+	char *src = bundled_editor_path();
+	char *html = src ? os_quick_read_utf8_file(src) : NULL;
+	bfree(src);
+	if (!html)
+		return NULL;
+
+	/* Without a websocket config the marker stays (it reads as null). */
+	struct dstr out = {0};
+	dstr_copy(&out, html);
+	bfree(html);
+	char *cfg = websocket_config_json();
+	if (cfg)
+		dstr_replace(&out, CONFIG_MARKER, cfg);
+	bfree(cfg);
+
+	char *dir = obs_module_config_path("");
+	if (dir)
+		os_mkdirs(dir);
+	bfree(dir);
+
+	char *dst = live_editor_path();
+	if (dst && !os_quick_write_utf8_file(dst, out.array, out.len, false)) {
+		blog(LOG_WARNING, LOG_PREFIX "could not write '%s'", dst);
+		bfree(dst);
+		dst = NULL;
+	}
+	dstr_free(&out);
+	return dst;
+}
+
+/* The editor to open: the live copy if it exists, else the bundled file. */
+static char *editor_path(void)
+{
+	char *live = live_editor_path();
+	if (live && os_file_exists(live))
+		return live;
+	bfree(live);
+	return bundled_editor_path();
 }
 
 /* file:// URL for a path, percent-encoding everything but unreserved chars. */
@@ -462,7 +562,9 @@ static bool on_open_editor(obs_properties_t *props, obs_property_t *p, void *dat
 	UNUSED_PARAMETER(p);
 	UNUSED_PARAMETER(data);
 
-	char *path = editor_path();
+	char *path = write_live_editor(); /* refresh connection details */
+	if (!path)
+		path = editor_path();
 	if (path) {
 		open_with_os(path);
 		bfree(path);
@@ -489,6 +591,12 @@ static obs_properties_t *hp_properties(void *data)
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 
+	obs_properties_t *editor = obs_properties_create();
+	obs_properties_add_button(editor, "open_editor", obs_module_text("OpenEditor"), on_open_editor);
+	obs_properties_add_text(editor, "editor_url", obs_module_text("EditorUrl"), OBS_TEXT_DEFAULT);
+	obs_properties_add_text(editor, "editor_hint", obs_module_text("EditorHint"), OBS_TEXT_INFO);
+	obs_properties_add_group(props, "editor", obs_module_text("Editor"), OBS_GROUP_NORMAL, editor);
+
 	obs_properties_t *corners = obs_properties_create();
 	for (int i = 0; i < NUM_COORDS; i++)
 		obs_properties_add_float_slider(corners, corner_keys[i], obs_module_text(corner_labels[i]), 0.0, 1.0,
@@ -511,24 +619,6 @@ static obs_properties_t *hp_properties(void *data)
 	obs_property_float_set_suffix(ph, " cm");
 	obs_properties_add_text(output, "pad_hint", obs_module_text("PadHint"), OBS_TEXT_INFO);
 	obs_properties_add_group(props, "output", obs_module_text("Output"), OBS_GROUP_NORMAL, output);
-
-	obs_properties_t *editor = obs_properties_create();
-	obs_properties_add_button(editor, "open_editor", obs_module_text("OpenEditor"), on_open_editor);
-
-	char *path = editor_path();
-	if (path) {
-		/* Selectable label with the file:// URL, for adding the editor as a dock. */
-		char *url = path_to_file_url(path);
-		const char *hint = obs_module_text("EditorUrlHint");
-		size_t n = strlen(hint) + strlen(url) + 32;
-		char *info = bmalloc(n);
-		snprintf(info, n, "%s<br><code>%s</code>", hint, url);
-		obs_properties_add_text(editor, "editor_url", info, OBS_TEXT_INFO);
-		bfree(info);
-		bfree(url);
-		bfree(path);
-	}
-	obs_properties_add_group(props, "editor", obs_module_text("Editor"), OBS_GROUP_NORMAL, editor);
 
 	return props;
 }
@@ -555,4 +645,10 @@ bool obs_module_load(void)
 	obs_register_source(&handcam_pin_filter);
 	blog(LOG_INFO, LOG_PREFIX "loaded version %s", PLUGIN_VERSION);
 	return true;
+}
+
+/* After all modules, so obs-websocket has written its config. */
+void obs_module_post_load(void)
+{
+	bfree(write_live_editor());
 }
