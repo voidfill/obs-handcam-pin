@@ -70,11 +70,11 @@ windows)
   "$ZIG" dlltool -m i386:x86-64 -d windows/obs.def -l "$BUILD/obs.lib"
   "$ZIG" cc -target x86_64-windows-gnu "${CFLAGS[@]}" -shared -s \
     -o "$BUILD/$NAME.dll" "src/$NAME.c" "$BUILD/obs.lib" -lshell32
-  # Layout of the OBS install folder (C:\Program Files\obs-studio).
-  STAGE="$DIST/stage"
-  mkdir -p "$STAGE/obs-plugins/64bit" "$STAGE/data/obs-plugins/$NAME"
-  cp "$BUILD/$NAME.dll" "$STAGE/obs-plugins/64bit/"
-  cp -r "${DATA_FILES[@]}" "$STAGE/data/obs-plugins/$NAME/"
+  # Same layout as Linux: goes into C:\ProgramData\obs-studio\plugins (no admin, OBS 30+).
+  STAGE="$DIST/stage"; PKG="$STAGE/$NAME"
+  mkdir -p "$PKG/bin/64bit" "$PKG/data"
+  cp "$BUILD/$NAME.dll" "$PKG/bin/64bit/"
+  cp -r "${DATA_FILES[@]}" "$PKG/data/"
   ;;
 esac
 echo "Built $NAME $VERSION ($OS) -> $STAGE/"
@@ -85,28 +85,27 @@ package)
   ZIPNAME="$NAME-$VERSION-$OS.zip"
   if [ "$OS" = windows ]; then
     # Windows' bsdtar writes proper zips (forward slashes, unlike Compress-Archive on PS 5.1).
-    (cd "$STAGE" && "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -a -cf "../$ZIPNAME" obs-plugins data)
+    (cd "$STAGE" && "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -a -cf "../$ZIPNAME" "$NAME")
   else
     (cd "$STAGE" && zip -qry "../$ZIPNAME" .)
   fi
   echo "Packaged $DIST/$ZIPNAME"
   ;;
 install)
-  # Per-user / no-admin plugin folders that OBS 30+ scans.
+  # No-admin plugin folders that OBS 30+ scans.
   case "$OS" in
-  linux)
-    DEST="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"
-    mkdir -p "$DEST"; rm -rf "$DEST/$NAME"; cp -r "$STAGE/$NAME" "$DEST/" ;;
-  macos)
-    DEST="$HOME/Library/Application Support/obs-studio/plugins"
-    mkdir -p "$DEST"; rm -rf "$DEST/$NAME.plugin"; cp -R "$STAGE/$NAME.plugin" "$DEST/" ;;
-  windows)
-    DEST="$(cygpath -u "${PROGRAMDATA:-C:\\ProgramData}")/obs-studio/plugins/$NAME"
-    mkdir -p "$DEST/bin/64bit" "$DEST/data"
-    cp "$STAGE/obs-plugins/64bit/$NAME.dll" "$DEST/bin/64bit/"
-    rm -rf "$DEST/data"/*; cp -r "$STAGE/data/obs-plugins/$NAME/"* "$DEST/data/" ;;
+  linux)   DEST="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"; ITEM="$NAME" ;;
+  macos)   DEST="$HOME/Library/Application Support/obs-studio/plugins"; ITEM="$NAME.plugin" ;;
+  windows) DEST="$(cygpath -u "${PROGRAMDATA:-C:\\ProgramData}")/obs-studio/plugins"; ITEM="$NAME"
+           # Windows locks the DLL while OBS runs; bail out before deleting anything.
+           if tasklist //FI "IMAGENAME eq obs64.exe" 2>/dev/null | grep -qi obs64.exe; then
+             echo "Close OBS first (it locks the plugin DLL), then run ./build.sh install again." >&2; exit 1
+           fi ;;
   esac
-  echo "Installed to $DEST (restart OBS to load a new build)"
+  mkdir -p "$DEST"
+  rm -rf "${DEST:?}/$ITEM"   # replace the whole folder so no stale files remain
+  cp -R "$STAGE/$ITEM" "$DEST/"
+  echo "Installed to $DEST/$ITEM (restart OBS to load a new build)"
   ;;
 *) echo "unknown command: $CMD (use build, package or install)" >&2; exit 1 ;;
 esac

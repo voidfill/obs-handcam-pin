@@ -50,7 +50,7 @@ jobs:
             linux)   nm -D --defined-only dist/stage/handcam-pin/bin/64bit/handcam-pin.so | grep -q obs_module_load ;;
             macos)   nm -gU dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin | grep -q obs_module_load
                      lipo -info dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin ;;
-            windows) grep -q obs_module_load dist/stage/obs-plugins/64bit/handcam-pin.dll ;;
+            windows) grep -q obs_module_load dist/stage/handcam-pin/bin/64bit/handcam-pin.dll ;;
           esac
 
       - uses: actions/upload-artifact@v7

@@ -19,19 +19,23 @@ Download the zip for your OS from the [Releases](../../releases) page.
 
 ### Windows
 
-Extract the zip into your OBS install folder, usually `C:\Program Files\obs-studio\`
-(admin rights needed). You should end up with:
-
-```
-C:\Program Files\obs-studio\obs-plugins\64bit\handcam-pin.dll
-C:\Program Files\obs-studio\data\obs-plugins\handcam-pin\   (editor.html, effect, locale)
-```
-
-<details><summary>No admin rights? Per-machine plugin folder (OBS 30+)</summary>
+Right-click the zip → *Extract All…* and type `C:\ProgramData\obs-studio\plugins` as
+the destination. Windows creates any missing folders, and no admin rights are needed.
+(`ProgramData` is hidden in Explorer, but typing the path works.) You should end up with:
 
 ```
 C:\ProgramData\obs-studio\plugins\handcam-pin\bin\64bit\handcam-pin.dll
-C:\ProgramData\obs-studio\plugins\handcam-pin\data\            (contents of data\obs-plugins\handcam-pin)
+C:\ProgramData\obs-studio\plugins\handcam-pin\data\
+```
+
+<details><summary>Portable OBS, or prefer the OBS install folder?</summary>
+
+Portable OBS may only look in its own folder. Copy the files there instead (this
+needs admin rights for `C:\Program Files`):
+
+```
+<OBS folder>\obs-plugins\64bit\handcam-pin.dll        ← from handcam-pin\bin\64bit\
+<OBS folder>\data\obs-plugins\handcam-pin\            ← contents of handcam-pin\data\
 ```
 </details>
 
@@ -56,6 +60,11 @@ xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins
 ```
 
 Restart OBS after installing. In the log you should see `[handcam-pin] loaded version …`.
+
+**Updating:** close OBS, delete the old `handcam-pin` folder (`handcam-pin.plugin`
+on macOS), extract the new one in its place, and start OBS. Your corners and shape
+are stored in your OBS scene collection, so they're kept. **Uninstalling:** delete
+that folder.
 
 ## Usage
 
