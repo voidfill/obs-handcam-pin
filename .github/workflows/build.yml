@@ -47,8 +47,8 @@ jobs:
       - name: Check exported symbols
         run: |
           case "${{ matrix.os }}" in
-            linux)   nm -D --defined-only dist/stage/handcam-pin/bin/64bit/handcam-pin.so | grep -q obs_module_load ;;
-            macos)   nm -gU dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin | grep -q obs_module_load
+            linux)   nm -D --defined-only dist/stage/handcam-pin/bin/64bit/handcam-pin.so | grep obs_module_load >/dev/null ;;
+            macos)   nm -gU dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin | grep obs_module_load >/dev/null
                      lipo -info dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin ;;
             windows) grep -q obs_module_load dist/stage/handcam-pin/bin/64bit/handcam-pin.dll ;;
           esac
@@ -73,4 +73,4 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)

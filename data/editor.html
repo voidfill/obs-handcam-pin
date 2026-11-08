@@ -183,6 +183,8 @@ class Obs {
       try { ws = new WebSocket(url, "obswebsocket.json"); } catch (e) { reject(e); return; }
       this.ws = ws;
       let identified = false;
+      // A socket that opens but never completes the handshake would hang forever.
+      const timeout = setTimeout(() => { if (!identified) { reject(new Error("OBS didn't answer")); ws.close(); } }, 5000);
       ws.onmessage = (ev) => {
         let msg; try { msg = JSON.parse(ev.data); } catch { return; }
         const d = msg.d || {};
@@ -195,7 +197,7 @@ class Obs {
           }
           ws.send(JSON.stringify({ op: 1, d: ident }));
         } else if (msg.op === 2) {
-          identified = true; resolve();
+          identified = true; clearTimeout(timeout); resolve();
         } else if (msg.op === 5) {
           if (this.onevent) try { this.onevent(d.eventType, d.eventData || {}); } catch (e) { console.error(e); }
         } else if (msg.op === 7) {
@@ -208,6 +210,7 @@ class Obs {
       };
       ws.onerror = () => { if (!identified) reject(new Error("cannot reach obs-websocket at " + url)); };
       ws.onclose = (ev) => {
+        clearTimeout(timeout);
         if (!identified) reject(new Error(ev.code === 4009 ? "wrong password" : `connection closed (${ev.code})`));
         if (this.ws !== ws) return; // replaced by a newer connection
         for (const p of this.pending.values()) p.reject(new Error("connection closed"));
@@ -226,7 +229,14 @@ class Obs {
       this.ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, requestData } }));
     });
   }
-  close() { if (this.ws) { this.onclose = null; this.ws.close(); } }
+  close() {
+    const ws = this.ws;
+    if (!ws) return;
+    this.ws = null; this.onclose = null;
+    for (const p of this.pending.values()) p.reject(new Error("connection closed"));
+    this.pending.clear();
+    ws.close();
+  }
 }
 
 /* ---------------- geometry ---------------- */
@@ -392,8 +402,9 @@ function pushCorners() {
   if (!inflight) flush();
 }
 async function flush() {
-  if (!dirty || !target || !obs.connected) return;
+  if (!dirty) return;
   dirty = false;
+  if (!target || !obs.connected) return;
   if (!isConvex(corners)) return;
   inflight = true;
   const filterSettings = {};
@@ -502,14 +513,15 @@ $("grid").onchange = draw;
 const AUDIO_KIND = /^(wasapi_|pulse_|coreaudio_|alsa_|jack_|sndio_|oss_|decklink-captions)/;
 let sourceList = [];        // [{ source, filter|null, multi }]
 let preferred = null;       // { source, filter } to select after the next refresh
-let refreshing = null;
+let refreshing = null, refreshAgain = false;
 
 // Rebuild the Source dropdown: inputs that have a Handcam Pin filter first
 // (one entry per filter), then other video inputs that could get one.
 function refreshSources(pref) {
   if (pref) preferred = pref;
-  if (refreshing) return refreshing;
-  refreshing = (async () => {
+  if (refreshing) { refreshAgain = true; return refreshing; }
+  refreshing = (async () => { do {
+    refreshAgain = false;
     const { inputs } = await obs.call("GetInputList");
     const entries = [];
     await Promise.all(inputs.map(async (inp) => {
@@ -550,7 +562,7 @@ function refreshSources(pref) {
       || entries.find((e) => e.filter) || entries[0];
     if (pick) sel.value = String(entries.indexOf(pick));
     await selectEntry(pick);
-  })().finally(() => { refreshing = null; });
+  } while (refreshAgain); })().finally(() => { refreshing = null; });
   return refreshing;
 }
 
@@ -662,10 +674,9 @@ setInterval(async () => {
   } catch {}
 }, 500);
 
-async function loadCorners() {
-  if (!target) return;
+async function loadCorners(t) {
   const [{ filterSettings }, { defaultFilterSettings }] = await Promise.all([
-    obs.call("GetSourceFilter", { sourceName: target.source, filterName: target.filter }),
+    obs.call("GetSourceFilter", { sourceName: t.source, filterName: t.filter }),
     obs.call("GetSourceFilterDefaultSettings", { filterKind: FILTER_KIND }),
   ]);
   defaultsCache = defaultFilterSettings;
@@ -676,40 +687,69 @@ async function loadCorners() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Filters a grab switched off, kept in local storage until they're back on, so
+// an interrupted grab (connection lost, dock reloaded) is undone on the next connect.
+const DISABLED_KEY = "disabled";
+function rememberDisabled(source, filters) {
+  if (filters.length) store.set(DISABLED_KEY, JSON.stringify({ source, filters }));
+  else store.del(DISABLED_KEY);
+}
+async function reenableFilters(source, names) {
+  const failed = [];
+  for (const name of names) {
+    try { await obs.call("SetSourceFilterEnabled", { sourceName: source, filterName: name, filterEnabled: true }); }
+    catch (e) {
+      // A filter that no longer exists needs nothing; anything else is retried later.
+      if (!obs.connected) failed.push(name);
+      else if (!/No (source|filter) was found/i.test(e.message)) { failed.push(name); setMsg(`Could not re-enable "${name}": ${e.message}`, true); }
+    }
+  }
+  rememberDisabled(source, failed);
+}
+async function restoreInterruptedGrab() {
+  let saved = null;
+  try { saved = JSON.parse(store.get(DISABLED_KEY, "null")); } catch {}
+  if (saved && saved.source && Array.isArray(saved.filters)) await reenableFilters(saved.source, saved.filters);
+}
+
 async function grab() {
-  if (!target) throw new Error("Pick a source with a Handcam Pin filter first.");
+  const t = target; // renames update this object in place
+  if (!t) throw new Error("Pick a source with a Handcam Pin filter first.");
+  if (grabbing) return;
+  grabbing = true; // also pauses the output preview while our filter is off
   $("grabBtn").disabled = true;
   $("grabBtn").textContent = "Grabbing…";
-  const reenable = [];
-  // Keep the output preview from capturing while our filter is switched off.
-  grabbing = true;
+  $("source").disabled = true;
+  const disabled = [];
   await previewInflight;
   try {
-    await loadCorners();
-    const { filters } = await obs.call("GetSourceFilterList", { sourceName: target.source });
-    const ours = filters.find((f) => f.filterName === target.filter);
+    await loadCorners(t);
+    const { filters } = await obs.call("GetSourceFilterList", { sourceName: t.source });
+    const ours = filters.find((f) => f.filterName === t.filter);
+    if (!ours) throw new Error(`"${t.source}" no longer has a filter called "${t.filter}".`);
     // Disable our filter and everything after it, so the frame is exactly our input.
     for (const f of filters) {
       if (f.filterIndex >= ours.filterIndex && f.filterEnabled) {
-        await obs.call("SetSourceFilterEnabled", { sourceName: target.source, filterName: f.filterName, filterEnabled: false });
-        reenable.push(f.filterName);
+        disabled.push(f.filterName);
+        rememberDisabled(t.source, disabled);
+        await obs.call("SetSourceFilterEnabled", { sourceName: t.source, filterName: f.filterName, filterEnabled: false });
       }
     }
     await sleep(80);
-    const { imageData } = await obs.call("GetSourceScreenshot", { sourceName: target.source, imageFormat: "png" });
+    const { imageData } = await obs.call("GetSourceScreenshot", { sourceName: t.source, imageFormat: "png" });
     const im = new Image();
     await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error("could not decode screenshot")); im.src = imageData; });
-    img = im; imgW = im.naturalWidth; imgH = im.naturalHeight;
-    $("rawLabel").textContent = `Raw frame · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
-    setMsg("");
-  } finally {
-    grabbing = false;
-    for (const name of reenable) {
-      try { await obs.call("SetSourceFilterEnabled", { sourceName: target.source, filterName: name, filterEnabled: true }); }
-      catch (e) { setMsg(`Could not re-enable "${name}": ${e.message}`, true); }
+    if (target === t) {
+      img = im; imgW = im.naturalWidth; imgH = im.naturalHeight;
+      $("rawLabel").textContent = `Raw frame · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
+      setMsg("");
     }
+  } finally {
+    await reenableFilters(t.source, disabled);
+    grabbing = false;
     $("grabBtn").disabled = !obs.connected;
     $("grabBtn").textContent = "Grab frame";
+    $("source").disabled = !obs.connected || !sourceList.length;
     draw();
   }
 }
@@ -762,6 +802,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) sche
 obs.onevent = onObsEvent;
 async function afterConnect() {
   try {
+    await restoreInterruptedGrab();
     // After a reconnect, re-grab even if the same source is picked again.
     const pref = target || preferred;
     target = null;
@@ -778,7 +819,8 @@ async function connect() {
   const host = $("host").value.trim() || "127.0.0.1", port = $("port").value.trim() || "4455";
   const password = $("password").value;
   store.set("host", host); store.set("port", port);
-  if ($("remember").checked) store.set("password", password); else store.del("password");
+  const injected = INJECTED && password === INJECTED.password;
+  if ($("remember").checked && !injected) store.set("password", password); else store.del("password");
   store.set("remember", $("remember").checked ? "1" : "0");
   obs.close();
   setStatus("connecting…", "busy");
@@ -808,7 +850,7 @@ async function connect() {
 }
 function updateButtons() {
   const c = obs.connected;
-  $("grabBtn").disabled = !c; $("refreshBtn").disabled = !c; $("camBtn").disabled = !c;
+  $("grabBtn").disabled = !c || grabbing; $("refreshBtn").disabled = !c; $("camBtn").disabled = !c; $("addBtn").disabled = !c;
   if (!c) $("source").disabled = true;
 }
 $("connectBtn").onclick = connect;

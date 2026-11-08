@@ -24,7 +24,12 @@
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron()) /* bundles can't use environ directly */
+#else
 extern char **environ;
+#endif
 #endif
 
 #ifndef PLUGIN_VERSION
@@ -163,17 +168,13 @@ static const char *hp_get_name(void *unused)
 	return obs_module_text("HandcamPin");
 }
 
-static char *editor_path(void);
-static char *path_to_file_url(const char *path);
+/* file:// URL of the editor, set in obs_module_post_load. */
+static char *editor_url;
 
 static void hp_defaults(obs_data_t *settings)
 {
 	/* Shown in a text field so it can be copied (OBS info labels aren't selectable). */
-	char *path = editor_path();
-	char *url = path ? path_to_file_url(path) : NULL;
-	obs_data_set_default_string(settings, "editor_url", url ? url : "");
-	bfree(url);
-	bfree(path);
+	obs_data_set_default_string(settings, "editor_url", editor_url ? editor_url : "");
 
 	for (int i = 0; i < NUM_COORDS; i++)
 		obs_data_set_default_double(settings, corner_keys[i], default_corners[i]);
@@ -203,7 +204,7 @@ static void migrate_settings(obs_data_t *s)
  * so we never invent pixels; it only changes when the ratio (or camera) does. */
 static uint32_t even_px(double v)
 {
-	uint32_t p = (uint32_t)(v / 2.0 + 0.5) * 2;
+	uint32_t p = (uint32_t)(v / 2.0) * 2; /* round down: never larger than the camera */
 	return p < 2 ? 2 : p;
 }
 
@@ -232,9 +233,6 @@ static void hp_update(void *data, obs_data_t *settings)
 	struct handcam_pin *f = data;
 	double c[NUM_COORDS];
 	float h[9];
-
-	/* The URL field is for copying only: don't keep anything typed into it. */
-	obs_data_unset_user_value(settings, "editor_url");
 
 	for (int i = 0; i < NUM_COORDS; i++)
 		c[i] = obs_data_get_double(settings, corner_keys[i]);
@@ -323,15 +321,9 @@ static void hp_render(void *data, gs_effect_t *unused)
 	struct handcam_pin *f = data;
 	UNUSED_PARAMETER(unused);
 
-	obs_source_t *target = obs_filter_get_target(f->source);
-	if (!f->effect || !target || !obs_source_get_base_width(target) || !obs_source_get_base_height(target)) {
-		obs_source_skip_video_filter(f->source);
-		return;
-	}
-
 	uint32_t w, h;
 	output_size(f, &w, &h);
-	if (!w || !h) {
+	if (!f->effect || !w || !h) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
@@ -340,9 +332,7 @@ static void hp_render(void *data, gs_effect_t *unused)
 	if (!obs_source_process_filter_begin(f->source, GS_RGBA, OBS_NO_DIRECT_RENDERING))
 		return;
 
-	float m[9];
-	memcpy(m, f->h, sizeof(m));
-
+	const float *m = f->h;
 	struct vec3 r0, r1, r2;
 	vec3_set(&r0, m[0], m[1], m[2]);
 	vec3_set(&r1, m[3], m[4], m[5]);
@@ -427,15 +417,50 @@ static char *bundled_editor_path(void)
 	return abs_slashes(obs_module_file("editor.html"));
 }
 
+/* Our plugin_config folder, created if needed. On POSIX os_get_abs_path_ptr()
+ * uses realpath(), which fails for paths that don't exist yet, so only the
+ * (now existing) folder is made absolute and the file name appended after. */
 static char *live_editor_path(void)
 {
-	return abs_slashes(obs_module_config_path("editor.html"));
+	char *dir = obs_module_config_path("");
+	if (!dir)
+		return NULL;
+	os_mkdirs(dir);
+	char *abs = abs_slashes(dir);
+	if (!abs)
+		return NULL;
+	struct dstr path = {0};
+	dstr_copy(&path, abs);
+	bfree(abs);
+	if (path.len && path.array[path.len - 1] != '/')
+		dstr_cat(&path, "/");
+	dstr_cat(&path, "editor.html");
+	return path.array;
+}
+
+/* plugin_config/obs-websocket/config.json, built from our own config folder
+ * by text (a ".." path would need our folder to exist on POSIX). */
+static char *websocket_config_path(void)
+{
+	char *dir = obs_module_config_path(""); /* .../plugin_config/handcam-pin/ */
+	if (!dir)
+		return NULL;
+	size_t n = strlen(dir);
+	while (n && (dir[n - 1] == '/' || dir[n - 1] == '\\'))
+		n--;
+	while (n && dir[n - 1] != '/' && dir[n - 1] != '\\')
+		n--;
+	struct dstr path = {0};
+	dstr_ncopy(&path, dir, n);
+	dstr_cat(&path, "obs-websocket/config.json");
+	bfree(dir);
+	return path.array;
 }
 
 /* JSON for the editor, or NULL if obs-websocket has no config yet. */
 static char *websocket_config_json(void)
 {
-	char *ws_path = obs_module_config_path("../obs-websocket/config.json");
+	char *ws_path = websocket_config_path();
 	obs_data_t *ws = ws_path ? obs_data_create_from_json_file(ws_path) : NULL;
 	bfree(ws_path);
 	if (!ws)
@@ -474,13 +499,9 @@ static char *write_live_editor(void)
 		dstr_replace(&out, CONFIG_MARKER, cfg);
 	bfree(cfg);
 
-	char *dir = obs_module_config_path("");
-	if (dir)
-		os_mkdirs(dir);
-	bfree(dir);
-
+	/* Written via a temp file, so a dock loading it never sees half a page. */
 	char *dst = live_editor_path();
-	if (dst && !os_quick_write_utf8_file(dst, out.array, out.len, false)) {
+	if (dst && !os_quick_write_utf8_file_safe(dst, out.array, out.len, false, "tmp", NULL)) {
 		blog(LOG_WARNING, LOG_PREFIX "could not write '%s'", dst);
 		bfree(dst);
 		dst = NULL;
@@ -547,7 +568,7 @@ static void open_with_os(const char *path)
 	/* sh backgrounds the opener and exits at once, so the wait is immediate. */
 	char *argv[] = {"sh", "-c", (char *)script, "sh", (char *)path, NULL};
 	pid_t pid;
-	if (posix_spawnp(&pid, "sh", NULL, NULL, argv, environ) == 0) {
+	if (posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ) == 0) {
 		int status;
 		waitpid(pid, &status, 0);
 	} else {
@@ -574,6 +595,16 @@ static bool on_open_editor(obs_properties_t *props, obs_property_t *p, void *dat
 	return false;
 }
 
+/* The Dock URL field is for copying only: don't keep anything typed into it.
+ * (Runs on the UI thread, which owns the settings while the dialog is open.) */
+static bool on_editor_url_edited(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	obs_data_unset_user_value(settings, "editor_url");
+	return false;
+}
+
 /* Mousepad size fields only matter for the "pad" shape. */
 static bool on_shape_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
@@ -593,7 +624,8 @@ static obs_properties_t *hp_properties(void *data)
 
 	obs_properties_t *editor = obs_properties_create();
 	obs_properties_add_button(editor, "open_editor", obs_module_text("OpenEditor"), on_open_editor);
-	obs_properties_add_text(editor, "editor_url", obs_module_text("EditorUrl"), OBS_TEXT_DEFAULT);
+	obs_property_t *url = obs_properties_add_text(editor, "editor_url", obs_module_text("EditorUrl"), OBS_TEXT_DEFAULT);
+	obs_property_set_modified_callback(url, on_editor_url_edited);
 	obs_properties_add_text(editor, "editor_hint", obs_module_text("EditorHint"), OBS_TEXT_INFO);
 	obs_properties_add_group(props, "editor", obs_module_text("Editor"), OBS_GROUP_NORMAL, editor);
 
@@ -651,4 +683,13 @@ bool obs_module_load(void)
 void obs_module_post_load(void)
 {
 	bfree(write_live_editor());
+	char *path = editor_path();
+	editor_url = path ? path_to_file_url(path) : NULL;
+	bfree(path);
+}
+
+void obs_module_unload(void)
+{
+	bfree(editor_url);
+	editor_url = NULL;
 }

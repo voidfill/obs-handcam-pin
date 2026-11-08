@@ -61,7 +61,7 @@ macos)
   mkdir -p "$B/MacOS" "$B/Resources"
   cp "$BUILD/$NAME" "$B/MacOS/$NAME"
   cp -r "${DATA_FILES[@]}" "$B/Resources/"
-  sed -e "s/@VERSION@/$VERSION/g" -e "s/@NAME@/$NAME/g" macos/Info.plist.in > "$B/Info.plist"
+  sed -e "s|@VERSION@|$VERSION|g" -e "s|@NAME@|$NAME|g" macos/Info.plist.in > "$B/Info.plist"
   codesign --force --sign - "$STAGE/$NAME.plugin"   # ad-hoc; required on Apple Silicon
   ;;
 windows)
@@ -98,7 +98,7 @@ install)
   macos)   DEST="$HOME/Library/Application Support/obs-studio/plugins"; ITEM="$NAME.plugin" ;;
   windows) DEST="$(cygpath -u "${PROGRAMDATA:-C:\\ProgramData}")/obs-studio/plugins"; ITEM="$NAME"
            # Windows locks the DLL while OBS runs; bail out before deleting anything.
-           if tasklist //FI "IMAGENAME eq obs64.exe" 2>/dev/null | grep -qi obs64.exe; then
+           if tasklist //FI "IMAGENAME eq obs64.exe" 2>/dev/null | grep -i obs64.exe >/dev/null; then
              echo "Close OBS first (it locks the plugin DLL), then run ./build.sh install again." >&2; exit 1
            fi ;;
   esac

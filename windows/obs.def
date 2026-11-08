@@ -7,6 +7,8 @@ EXPORTS
 	blog
 	bmalloc
 	dstr_copy
+	dstr_ncat
+	dstr_ncopy
 	dstr_replace
 	gs_effect_create_from_file
 	gs_effect_destroy
@@ -58,7 +60,7 @@ EXPORTS
 	os_get_abs_path_ptr
 	os_mkdirs
 	os_quick_read_utf8_file
-	os_quick_write_utf8_file
+	os_quick_write_utf8_file_safe
 	os_utf8_to_wcs_ptr
 	text_lookup_destroy
 	text_lookup_getstr
