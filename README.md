@@ -9,9 +9,14 @@ output, straight-on.
 
 - Native plugin in plain C. It depends only on libobs, with no Qt and no
   obs-shaderfilter.
-- Works on Windows (D3D11), Linux and macOS (OpenGL), OBS 31 and newer.
+- Builds for Windows, Linux and macOS (universal), for OBS 31 and newer.
 - The editor works in any browser and as an OBS dock. It shows a live preview of
   the output while you drag.
+
+> **Status:** tested on Windows 11 with OBS 32.2, using both the Direct3D 11 and
+> OpenGL renderers. The Linux and macOS builds come from CI and haven't been tried
+> on real machines yet. If you run one, please
+> [open an issue](../../issues) to say whether it works.
 
 ## Install
 
