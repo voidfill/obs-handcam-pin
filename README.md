@@ -5,6 +5,8 @@ An OBS Studio video filter that perspective-corrects an angled webcam, such as a
 mousepad in a small browser editor, and the filter warps that area so it fills the
 output, straight-on.
 
+![The editor as an OBS dock: corners dragged onto the mousepad in the raw camera frame (left), live warped output (right)](docs/editor.jpg)
+
 - Native plugin in plain C. It depends only on libobs, with no Qt and no
   obs-shaderfilter.
 - Works on Windows (D3D11), Linux and macOS (OpenGL), OBS 31 and newer.
