@@ -3,32 +3,41 @@
 ; libobs function, add it here (the link step will tell you which is missing).
 LIBRARY obs.dll
 EXPORTS
-	blog
 	bfree
+	blog
 	bmalloc
 	gs_effect_create_from_file
 	gs_effect_destroy
 	gs_effect_get_param_by_name
 	gs_effect_set_vec3
 	obs_data_create
+	obs_data_erase
 	obs_data_get_double
 	obs_data_get_int
+	obs_data_get_string
+	obs_data_has_user_value
 	obs_data_release
 	obs_data_set_default_double
-	obs_data_set_default_int
+	obs_data_set_default_string
 	obs_data_set_double
+	obs_data_set_string
 	obs_enter_graphics
 	obs_filter_get_target
 	obs_find_module_file
 	obs_leave_graphics
 	obs_module_load_locale
 	obs_properties_add_button
+	obs_properties_add_float
 	obs_properties_add_float_slider
 	obs_properties_add_group
-	obs_properties_add_int
+	obs_properties_add_list
 	obs_properties_add_text
 	obs_properties_create
-	obs_property_int_set_suffix
+	obs_properties_get
+	obs_property_float_set_suffix
+	obs_property_list_add_string
+	obs_property_set_modified_callback
+	obs_property_set_visible
 	obs_register_source_s
 	obs_source_get_base_height
 	obs_source_get_base_width

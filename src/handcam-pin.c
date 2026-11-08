@@ -63,8 +63,7 @@ struct handcam_pin {
 
 	double corners[NUM_COORDS]; /* last valid corners */
 	float h[9];                 /* row-major 3x3, unit square -> source uv */
-	uint32_t out_width;         /* 0 = source size */
-	uint32_t out_height;
+	double aspect;              /* output width/height; 0 = same as the camera */
 };
 
 /* ------------------------------------------------------------------------ */
@@ -167,8 +166,54 @@ static void hp_defaults(obs_data_t *settings)
 {
 	for (int i = 0; i < NUM_COORDS; i++)
 		obs_data_set_default_double(settings, corner_keys[i], default_corners[i]);
-	obs_data_set_default_int(settings, "out_width", 0);
-	obs_data_set_default_int(settings, "out_height", 0);
+	obs_data_set_default_string(settings, "shape", "pad");
+	obs_data_set_default_double(settings, "pad_width", 45.0);
+	obs_data_set_default_double(settings, "pad_height", 40.0);
+}
+
+/* 0.0.x stored an explicit output size in pixels; keep its shape as a ratio. */
+static void migrate_settings(obs_data_t *s)
+{
+	long long ow = obs_data_get_int(s, "out_width");
+	long long oh = obs_data_get_int(s, "out_height");
+	if (!obs_data_has_user_value(s, "shape") && ow > 0 && oh > 0) {
+		obs_data_set_string(s, "shape", "pad");
+		obs_data_set_double(s, "pad_width", round(400.0 * (double)ow / (double)oh) / 10.0);
+		obs_data_set_double(s, "pad_height", 40.0);
+	} else if (!obs_data_has_user_value(s, "shape") && (obs_data_has_user_value(s, "out_width") ||
+							    obs_data_has_user_value(s, "out_height"))) {
+		obs_data_set_string(s, "shape", "source"); /* old 0 = source size */
+	}
+	obs_data_erase(s, "out_width");
+	obs_data_erase(s, "out_height");
+}
+
+/* Output = largest size with the wanted ratio that fits inside the camera frame,
+ * so we never invent pixels; it only changes when the ratio (or camera) does. */
+static uint32_t even_px(double v)
+{
+	uint32_t p = (uint32_t)(v / 2.0 + 0.5) * 2;
+	return p < 2 ? 2 : p;
+}
+
+static void output_size(struct handcam_pin *f, uint32_t *ow, uint32_t *oh)
+{
+	obs_source_t *target = obs_filter_get_target(f->source);
+	uint32_t sw = target ? obs_source_get_base_width(target) : 0;
+	uint32_t sh = target ? obs_source_get_base_height(target) : 0;
+	double r = f->aspect;
+
+	*ow = sw;
+	*oh = sh;
+	if (!sw || !sh || r <= 0.0)
+		return;
+	if (r >= (double)sw / (double)sh) {
+		*ow = even_px(sw);
+		*oh = even_px(sw / r);
+	} else {
+		*ow = even_px(sh * r);
+		*oh = even_px(sh);
+	}
 }
 
 static void hp_update(void *data, obs_data_t *settings)
@@ -188,10 +233,15 @@ static void hp_update(void *data, obs_data_t *settings)
 		     obs_source_get_name(f->source));
 	}
 
-	long long ow = obs_data_get_int(settings, "out_width");
-	long long oh = obs_data_get_int(settings, "out_height");
-	f->out_width = ow > 0 ? (uint32_t)ow : 0;
-	f->out_height = oh > 0 ? (uint32_t)oh : 0;
+	const char *shape = obs_data_get_string(settings, "shape");
+	double pw = obs_data_get_double(settings, "pad_width");
+	double ph = obs_data_get_double(settings, "pad_height");
+	double aspect = 0.0; /* "source" */
+	if (shape && strcmp(shape, "square") == 0)
+		aspect = 1.0;
+	else if (shape && strcmp(shape, "pad") == 0 && isfinite(pw) && isfinite(ph) && pw > 0.0 && ph > 0.0)
+		aspect = fmin(20.0, fmax(0.05, pw / ph));
+	f->aspect = aspect;
 }
 
 static void *hp_create(obs_data_t *settings, obs_source_t *source)
@@ -223,6 +273,7 @@ static void *hp_create(obs_data_t *settings, obs_source_t *source)
 	bfree(errors);
 	bfree(path);
 
+	migrate_settings(settings);
 	hp_update(f, settings);
 	return f;
 }
@@ -241,20 +292,16 @@ static void hp_destroy(void *data)
 
 static uint32_t hp_get_width(void *data)
 {
-	struct handcam_pin *f = data;
-	if (f->out_width)
-		return f->out_width;
-	obs_source_t *target = obs_filter_get_target(f->source);
-	return target ? obs_source_get_base_width(target) : 0;
+	uint32_t w, h;
+	output_size(data, &w, &h);
+	return w;
 }
 
 static uint32_t hp_get_height(void *data)
 {
-	struct handcam_pin *f = data;
-	if (f->out_height)
-		return f->out_height;
-	obs_source_t *target = obs_filter_get_target(f->source);
-	return target ? obs_source_get_base_height(target) : 0;
+	uint32_t w, h;
+	output_size(data, &w, &h);
+	return h;
 }
 
 static void hp_render(void *data, gs_effect_t *unused)
@@ -268,8 +315,8 @@ static void hp_render(void *data, gs_effect_t *unused)
 		return;
 	}
 
-	uint32_t w = hp_get_width(f);
-	uint32_t h = hp_get_height(f);
+	uint32_t w, h;
+	output_size(f, &w, &h);
 	if (!w || !h) {
 		obs_source_skip_video_filter(f->source);
 		return;
@@ -425,6 +472,18 @@ static bool on_open_editor(obs_properties_t *props, obs_property_t *p, void *dat
 	return false;
 }
 
+/* Mousepad size fields only matter for the "pad" shape. */
+static bool on_shape_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	const char *shape = obs_data_get_string(settings, "shape");
+	bool pad = shape && strcmp(shape, "pad") == 0;
+	obs_property_set_visible(obs_properties_get(props, "pad_width"), pad);
+	obs_property_set_visible(obs_properties_get(props, "pad_height"), pad);
+	obs_property_set_visible(obs_properties_get(props, "pad_hint"), pad);
+	return true;
+}
+
 static obs_properties_t *hp_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
@@ -440,11 +499,17 @@ static obs_properties_t *hp_properties(void *data)
 	obs_properties_add_group(props, "corners", obs_module_text("Corners"), OBS_GROUP_NORMAL, corners);
 
 	obs_properties_t *output = obs_properties_create();
-	obs_property_t *ow = obs_properties_add_int(output, "out_width", obs_module_text("OutWidth"), 0, 16384, 1);
-	obs_property_int_set_suffix(ow, " px");
-	obs_property_t *oh = obs_properties_add_int(output, "out_height", obs_module_text("OutHeight"), 0, 16384, 1);
-	obs_property_int_set_suffix(oh, " px");
-	obs_properties_add_text(output, "out_hint", obs_module_text("OutHint"), OBS_TEXT_INFO);
+	obs_property_t *shape = obs_properties_add_list(output, "shape", obs_module_text("Shape"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(shape, obs_module_text("ShapePad"), "pad");
+	obs_property_list_add_string(shape, obs_module_text("ShapeSquare"), "square");
+	obs_property_list_add_string(shape, obs_module_text("ShapeSource"), "source");
+	obs_property_set_modified_callback(shape, on_shape_changed);
+	obs_property_t *pw = obs_properties_add_float(output, "pad_width", obs_module_text("PadWidth"), 1.0, 1000.0, 0.1);
+	obs_property_float_set_suffix(pw, " cm");
+	obs_property_t *ph = obs_properties_add_float(output, "pad_height", obs_module_text("PadHeight"), 1.0, 1000.0, 0.1);
+	obs_property_float_set_suffix(ph, " cm");
+	obs_properties_add_text(output, "pad_hint", obs_module_text("PadHint"), OBS_TEXT_INFO);
 	obs_properties_add_group(props, "output", obs_module_text("Output"), OBS_GROUP_NORMAL, output);
 
 	obs_properties_t *editor = obs_properties_create();

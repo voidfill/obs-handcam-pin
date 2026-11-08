@@ -22,6 +22,7 @@
     border-radius: 4px; padding: 4px 6px; min-height: 26px; }
   input[type=text], input[type=password] { width: 9em; }
   input.narrow { width: 4.5em; }
+  input.num { width: 4.2em; }
   select#source { max-width: 16em; }
   input[type=checkbox] { min-height: 0; }
   button { cursor: pointer; background: #353842; }
@@ -71,6 +72,7 @@
   <button id="refreshBtn" title="Refresh the source list" disabled>↻</button>
   <button id="addBtn" class="hidden" title="Add a Handcam Pin filter to this source">Add filter</button>
   <button id="grabBtn" class="primary" disabled>Grab frame</button>
+  <button id="camBtn" disabled title="Open this source's properties in OBS (focus, exposure etc. are under Configure Video)">Camera settings</button>
 </header>
 
 <div id="stage">
@@ -89,6 +91,17 @@
   <button id="rotBtn" title="Cycle corners: TL←BL←BR←TR">Rotate 90°</button>
   <button id="mirBtn" title="Swap left and right corners">Mirror</button>
   <button id="resetBtn">Reset</button>
+  <span class="sep"></span>
+  <label title="Shape of the output. Only the ratio matters; the resolution is picked automatically.">Shape
+    <select id="shape">
+      <option value="pad">Mousepad size</option>
+      <option value="square">Square</option>
+      <option value="source">Same as camera</option>
+    </select></label>
+  <span id="padFields" title="Real mousepad size. Only the ratio matters, so mm or inches work too.">
+    <input id="padW" class="num" type="number" min="1" max="1000" step="0.1" value="45"> ×
+    <input id="padH" class="num" type="number" min="1" max="1000" step="0.1" value="40"> cm
+  </span>
   <label><input id="grid" type="checkbox" checked> grid</label>
   <label title="Show OBS's filtered output next to the editor"><input id="previewOn" type="checkbox" checked> preview</label>
   <span class="grow"></span>
@@ -591,13 +604,49 @@ function onObsEvent(type, d) {
 
 // Corners changed in OBS (sliders, Rotate/Mirror/Reset in the filter dialog):
 // follow them, unless we're editing or it could be an echo of our own push.
-const editingNow = () => drag || inflight || dirty || grabbing || performance.now() - lastPush < 400;
+const editingNow = () => drag || inflight || dirty || grabbing || shapeTimer || performance.now() - lastPush < 400;
 function adoptRemoteSettings(settings, issuedAt) {
   if (editingNow() || issuedAt < lastPush) return;
   const s = Object.assign({}, defaultsCache || {}, settings);
   const next = KEYS.map((k, i) => (typeof s[k] === "number" ? s[k] : corners[i]));
   if (next.some((v, i) => Math.abs(v - corners[i]) > 1e-6)) { corners = next; draw(); }
+  showShape(s);
 }
+
+/* ---------------- output shape (mousepad ratio / square / camera) ---------------- */
+let shapeTimer = null;
+function showShape(s) {
+  if (typeof s.shape === "string") $("shape").value = s.shape;
+  // Don't overwrite a field the user is typing in.
+  if (typeof s.pad_width === "number" && document.activeElement !== $("padW")) $("padW").value = +s.pad_width.toFixed(2);
+  if (typeof s.pad_height === "number" && document.activeElement !== $("padH")) $("padH").value = +s.pad_height.toFixed(2);
+  $("padFields").classList.toggle("hidden", $("shape").value !== "pad");
+}
+function onShapeInput() {
+  $("padFields").classList.toggle("hidden", $("shape").value !== "pad");
+  clearTimeout(shapeTimer);
+  shapeTimer = setTimeout(pushShape, 300);
+}
+async function pushShape() {
+  shapeTimer = null;
+  if (!target || !obs.connected) return;
+  const filterSettings = { shape: $("shape").value };
+  const w = parseFloat($("padW").value), h = parseFloat($("padH").value);
+  if (w > 0) filterSettings.pad_width = w;
+  if (h > 0) filterSettings.pad_height = h;
+  lastPush = performance.now();
+  try {
+    await obs.call("SetSourceFilterSettings", { sourceName: target.source, filterName: target.filter, filterSettings, overlay: true });
+  } catch (e) { setMsg(e.message, true); }
+  finally { lastPush = performance.now(); }
+}
+$("shape").onchange = onShapeInput;
+$("padW").oninput = onShapeInput;
+$("padH").oninput = onShapeInput;
+
+$("camBtn").onclick = () => {
+  if (target) obs.call("OpenInputPropertiesDialog", { inputName: target.source }).catch((e) => setMsg(e.message, true));
+};
 
 // OBS doesn't emit a settings-changed event for these updates, so poll (cheap).
 setInterval(async () => {
@@ -618,6 +667,7 @@ async function loadCorners() {
   defaultsCache = defaultFilterSettings;
   const s = Object.assign({}, defaultFilterSettings, filterSettings);
   corners = KEYS.map((k, i) => (typeof s[k] === "number" ? s[k] : DEFAULTS[i]));
+  showShape(s);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -744,7 +794,7 @@ async function connect() {
 }
 function updateButtons() {
   const c = obs.connected;
-  $("grabBtn").disabled = !c; $("refreshBtn").disabled = !c;
+  $("grabBtn").disabled = !c; $("refreshBtn").disabled = !c; $("camBtn").disabled = !c;
   if (!c) $("source").disabled = true;
   $("connectBtn").textContent = c ? "Reconnect" : "Connect";
 }

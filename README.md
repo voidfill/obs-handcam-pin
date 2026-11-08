@@ -71,6 +71,12 @@ Restart OBS after installing. In the log you should see `[handcam-pin] loaded ve
    (it switches the filter off for a moment) and loads the saved corners.
 6. **Drag the corners** onto the four corners of your mousepad. The right-hand
    pane shows the real OBS output live.
+7. **Set the shape.** Enter your mousepad's real size (e.g. 49 × 42 cm) so the
+   result isn't stretched, or pick *Square* or *Same as camera*.
+
+Tip: the output's pixel size changes when you change the shape, which resizes the
+source in your scene. To keep its box fixed, right-click the source in the scene →
+*Transform → Edit Transform* → *Bounding Box Type: Scale to inner bounds*.
 
 ### Editor controls
 
@@ -83,6 +89,8 @@ Restart OBS after installing. In the log you should see `[handcam-pin] loaded ve
 | Rotate 90° | Cycles the corners (TL←BL←BR←TR), turning the output a quarter turn |
 | Mirror | Swaps left and right corners |
 | Reset | Back to the default 10 % inset |
+| Shape | *Mousepad size* (width × height), *Square* or *Same as camera* |
+| Camera settings | Opens the source's OBS properties (focus, exposure etc. are under *Configure Video* on Windows) |
 | grid / preview | Toggle the perspective grid and the live output pane |
 
 The thick green edge is the top of the output. Changes are sent to OBS while you
@@ -99,7 +107,13 @@ kept in the browser's local storage.
 | Setting | Meaning |
 | --- | --- |
 | `tl_x` … `bl_y` | The four corners in normalized source coordinates (0–1, origin top-left). Default: 10 % inset. |
-| `out_width`, `out_height` | Output size in pixels. `0` means the source size. Set these to your mousepad's aspect ratio (e.g. 900 × 400) so the result isn't stretched. |
+| `shape` | `pad` (default): use the mousepad size below. `square`: 1:1. `source`: same ratio as the camera. |
+| `pad_width`, `pad_height` | Real mousepad size, labelled cm. Only the ratio matters, so mm or inches work too. Default: 45 × 40. |
+
+You never set pixels. The output is the largest size with the chosen ratio that
+fits inside the camera frame, so no pixels are invented. A 1920×1080 camera gives
+1920×853 for a 90 × 40 cm pad and 1080×1080 for *Square*. The size only changes
+when the shape or the camera resolution changes, never while you drag corners.
 
 The filter dialog also has Rotate 90°, Mirror and Reset buttons and sliders for fine
 tweaks. Non-convex or degenerate quads are ignored, and the last valid warp stays
