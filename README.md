@@ -1,11 +1,13 @@
 # Handcam Pin
 
 An OBS Studio video filter that perspective-corrects an angled webcam, such as a
-"handcam" filming your mouse from the side. You drag four corners onto your
+"handcam" filming your mouse from the side. Mounting the camera at a steep angle
+keeps your monitor from blocking its view of the mousepad, and the filter turns
+that skewed picture back into a straight-on one. You drag four corners onto your
 mousepad in a small browser editor, and the filter warps that area so it fills the
-output, straight-on.
+output.
 
-![The editor as an OBS dock: corners dragged onto the mousepad in the raw camera frame (left), live warped output (right)](docs/editor.jpg)
+![The editor: corners pinned onto a mousepad filmed at a steep angle in the live raw camera view (left), the straightened output (right)](docs/editor.jpg)
 
 - Native plugin in plain C. It depends only on libobs, with no Qt and no
   obs-shaderfilter.
