@@ -10,8 +10,8 @@ output, straight-on.
 - Native plugin in plain C. It depends only on libobs, with no Qt and no
   obs-shaderfilter.
 - Builds for Windows, Linux and macOS (universal), for OBS 31 and newer.
-- The editor works in any browser and as an OBS dock. It shows a live preview of
-  the output while you drag.
+- The editor works in any browser and as an OBS dock. Both the raw camera view
+  and the warped output update live while you drag.
 
 > **Status:** tested on Windows 11 with OBS 32.2, using both the Direct3D 11 and
 > OpenGL renderers. The Linux and macOS builds come from CI and haven't been tried
@@ -83,11 +83,11 @@ that folder.
    the *Dock URL* shown below the button into *Docks → Custom Browser Docks*.
 4. **Pick the source** from the *Source* dropdown. Sources that already have the
    filter are listed first. For any other video source, press **Add filter**.
-5. **Grab a frame.** The editor takes one still, unfiltered frame from the camera
-   (it switches the filter off for a moment) and loads the saved corners.
-6. **Drag the corners** onto the four corners of your mousepad. The right-hand
+   The left pane shows the camera as the filter receives it (unwarped, a few
+   frames per second), with the saved corners on top.
+5. **Drag the corners** onto the four corners of your mousepad. The right-hand
    pane shows the real OBS output live.
-7. **Set the shape.** Enter your mousepad's real size (e.g. 49 × 42 cm) so the
+6. **Set the shape.** Enter your mousepad's real size (e.g. 49 × 42 cm) so the
    result isn't stretched, or pick *Square* or *Same as camera*.
 
 Tip: the output's pixel size changes when you change the shape, which resizes the
@@ -108,6 +108,7 @@ source in your scene. To keep its box fixed, right-click the source in the scene
 | Shape | *Mousepad size* (width × height), *Square* or *Same as camera* |
 | Camera settings | Opens the source's OBS properties (focus, exposure etc. are under *Configure Video* on Windows) |
 | grid / preview | Toggle the perspective grid and the live output pane |
+| live | Keep the raw camera view updating. Turn it off to freeze it; *Grab frame* then takes a sharp still (up to 1920 px) |
 
 The thick green edge is the top of the output. Changes are sent to OBS while you
 drag, and changes made in OBS (sliders, the buttons in the filter dialog) appear in
@@ -170,9 +171,17 @@ Pushing a `v*` tag publishes a GitHub release with the three zips.
 
 - **Why "Open editor" isn't a link button.** OBS's URL buttons only open
   `http(s)` links, so the button asks the OS to open the bundled HTML file instead.
-- **The raw frame is a still.** A live raw view would mean switching the filter off
-  constantly, which would flicker your stream. Press *Grab frame* to refresh it.
-  The output pane is live.
+- **How the raw view works.** obs-websocket can only screenshot a source with its
+  filters applied, so the plugin answers the editor itself (an obs-websocket vendor
+  request, `handcam-pin` / `GetRawFrame`): it copies its own input while rendering,
+  scaled down to about the size the editor shows it (up to 1920 px while you drag
+  a corner, so the magnifier stays sharp). The filter stays on the whole time, so
+  your stream doesn't flicker. Against an older plugin the editor falls back to a
+  still taken by briefly switching the filter off.
+- **An idle editor costs nothing.** Both live panes stop polling OBS after a minute
+  without mouse or keyboard activity in the editor (handy when it stays open as a
+  dock while you stream) and resume as soon as you move the mouse over it. With
+  the editor closed, the plugin does no extra work at all.
 
 ## License
 

@@ -71,15 +71,15 @@
   <label>Source <select id="source" disabled><option>— connect first —</option></select></label>
   <button id="refreshBtn" title="Refresh the source list" disabled>↻</button>
   <button id="addBtn" class="hidden" title="Add a Handcam Pin filter to this source">Add filter</button>
-  <button id="grabBtn" class="primary" disabled>Grab frame</button>
+  <button id="grabBtn" class="primary hidden" disabled title="Take one sharp still of the camera (up to 1920 px)">Grab frame</button>
   <button id="camBtn" disabled title="Open this source's properties in OBS (focus, exposure etc. are under Configure Video)">Camera settings</button>
 </header>
 
 <div id="stage">
   <div id="editPane" class="pane">
     <canvas id="cv" tabindex="0"></canvas>
-    <div id="rawLabel" class="paneLabel">Raw frame — not grabbed yet</div>
-    <div id="msg">Connect to OBS, then grab a frame. Drag the corners onto your mousepad.</div>
+    <div id="rawLabel" class="paneLabel">Raw input</div>
+    <div id="msg">Connect to OBS and pick your camera, then drag the corners onto your mousepad.</div>
   </div>
   <div id="previewPane" class="pane">
     <img id="preview" alt="">
@@ -102,6 +102,7 @@
     <input id="padW" class="num" type="number" min="1" max="1000" step="0.1" value="45"> ×
     <input id="padH" class="num" type="number" min="1" max="1000" step="0.1" value="40"> cm
   </span>
+  <label id="liveLabel" title="Keep the raw camera view updating (a few frames per second). Off: press Grab frame for a sharp still (up to 1920 px)."><input id="liveOn" type="checkbox" checked> live</label>
   <label><input id="grid" type="checkbox" checked> grid</label>
   <label title="Show OBS's filtered output next to the editor"><input id="previewOn" type="checkbox" checked> preview</label>
   <span class="grow"></span>
@@ -382,8 +383,9 @@ function drawLoupe(r, p, idx) {
   let lx = p[0] + (idx === 1 || idx === 2 ? -R - 24 : R + 24), ly = p[1] + (idx >= 2 ? -R - 24 : R + 24);
   lx = Math.min(cv.clientWidth - R - 4, Math.max(R + 4, lx));
   ly = Math.min(cv.clientHeight - R - 4, Math.max(R + 4, ly));
-  const sx = (p[0] - r.x) / r.w * img.naturalWidth, sy = (p[1] - r.y) / r.h * img.naturalHeight;
-  const half = R / Z * (img.naturalWidth / r.w);
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height; // <img> or ImageBitmap
+  const sx = (p[0] - r.x) / r.w * iw, sy = (p[1] - r.y) / r.h * ih;
+  const half = R / Z * (iw / r.w);
   ctx.save();
   ctx.beginPath(); ctx.arc(lx, ly, R, 0, Math.PI * 2); ctx.clip();
   ctx.fillStyle = "#000"; ctx.fillRect(lx - R, ly - R, 2 * R, 2 * R);
@@ -570,7 +572,7 @@ async function selectEntry(e) {
   $("addBtn").classList.toggle("hidden", !e || !!e.filter);
   if (!e || !e.filter) {
     target = null; img = null;
-    $("rawLabel").textContent = "Raw frame — not grabbed yet";
+    $("rawLabel").textContent = "Raw input"; $("rawLabel").classList.remove("live");
     $("preview").removeAttribute("src");
     setMsg(e ? `"${e.source}" has no Handcam Pin filter yet — press "Add filter".` : "No video sources in OBS.", true);
     draw();
@@ -580,9 +582,13 @@ async function selectEntry(e) {
   target = { source: e.source, filter: e.filter };
   store.set("source", e.source); store.set("filter", e.filter);
   if (changed) {
+    const t = target;
     img = null;
     setMsg("");
-    await grab();
+    draw();
+    await loadCorners(t);
+    draw();
+    if (target === t) await grab(liveWanted() ? liveSize() : RAW_SHARP_MAX);
   }
 }
 
@@ -712,9 +718,122 @@ async function restoreInterruptedGrab() {
   if (saved && saved.source && Array.isArray(saved.filters)) await reenableFilters(saved.source, saved.filters);
 }
 
-async function grab() {
+/* ---------------- raw input (what the filter receives) ----------------
+   The plugin answers an obs-websocket vendor request with a copy of its input,
+   taken while it renders, so the filter stays on and this can run live.
+   Against a plugin without that request, fall back to switching the filter
+   off for one screenshot (legacyGrab): a still, refreshed by "Grab frame". */
+const RAW_INTERVAL = 200;   // ms between frame starts (≤5 fps; big frames take longer)
+const RAW_LIVE_MAX = 960;   // longest side of live frames, px
+const RAW_SHARP_MAX = 1920; // while dragging a corner (for the loupe) and for "Grab frame"
+let rawApi = null;          // null: not tried yet on this connection, true/false: plugin answers or not
+let rawTimer = null, rawFails = 0, rawBusy = false, rawSeq = 0, rawShown = 0;
+
+const liveWanted = () => $("liveOn").checked && rawApi !== false;
+function liveSize() {
+  if (drag && drag.kind === "corner") return RAW_SHARP_MAX;
+  const r = viewRect(), dpr = window.devicePixelRatio || 1;
+  return Math.max(160, Math.min(RAW_LIVE_MAX, Math.round(Math.max(r.w, r.h) * dpr)));
+}
+function updateLiveUi() {
+  const off = rawApi === false;
+  $("liveOn").disabled = off;
+  $("liveLabel").title = off
+    ? "This OBS's Handcam Pin plugin can't send its input to the editor, so the raw view is a still. Update the plugin to get a live view."
+    : "Keep the raw camera view updating (a few frames per second). Off: press Grab frame for a sharp still (up to 1920 px).";
+  $("grabBtn").classList.toggle("hidden", liveWanted());
+  if (!liveWanted() && $("rawLabel").classList.contains("live")) {
+    $("rawLabel").classList.remove("live");
+    $("rawLabel").textContent = "Raw input · frozen — Grab to refresh";
+  }
+}
+
+// Both live panes stop polling OBS after a minute without mouse or keyboard
+// activity here, so an editor left open as a dock costs nothing while you stream.
+const IDLE_MS = 60000;
+const IDLE_TEXT = "paused — move the mouse here to resume";
+let lastActivity = performance.now();
+const isIdle = () => performance.now() - lastActivity > IDLE_MS;
+function noteActivity() {
+  const wasIdle = isIdle();
+  lastActivity = performance.now();
+  if (wasIdle) { scheduleRaw(0); schedulePreview(0); }
+}
+for (const ev of ["pointermove", "pointerdown", "keydown", "wheel", "focus"])
+  window.addEventListener(ev, noteActivity, { capture: true, passive: true });
+function showIdle(labelId, name) {
+  const l = $(labelId);
+  if (l.classList.contains("live")) { l.classList.remove("live"); l.textContent = `${name} · ${IDLE_TEXT}`; }
+}
+
+// One frame of our filter's input. Resolves true if it was shown.
+async function fetchRaw(t, maxSize) {
+  const seq = ++rawSeq;
+  let res;
+  try {
+    ({ responseData: res = {} } = await obs.call("CallVendorRequest", {
+      vendorName: "handcam-pin", requestType: "GetRawFrame",
+      requestData: { source: t.source, filter: t.filter, max_size: maxSize } }));
+  } catch (e) {
+    if (obs.connected && /no (vendor|request) was found/i.test(e.message)) { rawApi = false; updateLiveUi(); }
+    throw e;
+  }
+  if (rawApi !== true) { rawApi = true; updateLiveUi(); }
+  if (res.error) throw new Error(res.error);
+  // Decoded off the main thread, so big frames don't stall dragging.
+  let bmp;
+  try { bmp = await createImageBitmap(await (await fetch(res.image)).blob()); }
+  catch { throw new Error("could not decode the camera image"); }
+  // Requests can overlap (Grab vs. the live loop); never show an older frame over a newer one.
+  if (target !== t || seq < rawShown) { bmp.close(); return false; }
+  rawShown = seq;
+  const old = img;
+  img = bmp; imgW = res.source_width || bmp.width; imgH = res.source_height || bmp.height;
+  draw();
+  if (old && old.close) old.close();
+  return true;
+}
+
+function scheduleRaw(ms) { clearTimeout(rawTimer); rawTimer = setTimeout(rawTick, ms); }
+async function rawTick() {
+  if (liveWanted() && isIdle()) { showIdle("rawLabel", "Raw input"); scheduleRaw(400); return; }
+  if (!liveWanted() || !obs.connected || !target || grabbing || rawBusy || document.hidden) { scheduleRaw(400); return; }
+  const t0 = performance.now(), t = target;
+  rawBusy = true;
+  try {
+    if (await fetchRaw(t, liveSize()) && liveWanted()) {
+      rawFails = 0;
+      $("rawLabel").textContent = "Raw input (live)";
+      $("rawLabel").classList.add("live");
+    }
+  } catch (e) {
+    rawFails++;
+    if (target === t && rawApi !== false) { $("rawLabel").textContent = "Raw input: " + e.message; $("rawLabel").classList.remove("live"); }
+  } finally {
+    rawBusy = false;
+    const backoff = rawFails ? Math.min(3000, 250 * rawFails) : 0;
+    scheduleRaw(Math.max(0, RAW_INTERVAL - (performance.now() - t0)) + backoff);
+  }
+}
+$("liveOn").onchange = () => { store.set("live", $("liveOn").checked ? "1" : "0"); updateLiveUi(); scheduleRaw(0); };
+
+// "Grab frame", and the first frame after picking a source.
+async function grab(maxSize = RAW_SHARP_MAX) {
   const t = target; // renames update this object in place
   if (!t) throw new Error("Pick a source with a Handcam Pin filter first.");
+  if (rawApi !== false) {
+    try {
+      if (await fetchRaw(t, maxSize) && !liveWanted())
+        $("rawLabel").textContent = `Raw input · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
+      return;
+    } catch (e) {
+      if (rawApi !== false) throw e;
+    }
+  }
+  await legacyGrab(t);
+}
+
+async function legacyGrab(t) {
   if (grabbing) return;
   grabbing = true; // also pauses the output preview while our filter is off
   $("grabBtn").disabled = true;
@@ -741,7 +860,7 @@ async function grab() {
     await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error("could not decode screenshot")); im.src = imageData; });
     if (target === t) {
       img = im; imgW = im.naturalWidth; imgH = im.naturalHeight;
-      $("rawLabel").textContent = `Raw frame · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
+      $("rawLabel").textContent = `Raw input · grabbed ${new Date().toLocaleTimeString()} — Grab to refresh`;
       setMsg("");
     }
   } finally {
@@ -766,6 +885,7 @@ function schedulePreview(ms) { clearTimeout(previewTimer); previewTimer = setTim
 function previewTick() {
   const on = $("previewOn").checked;
   $("previewPane").classList.toggle("hidden", !on);
+  if (on && isIdle()) { showIdle("previewLabel", "Output"); schedulePreview(400); return; }
   if (!on || !obs.connected || !target || grabbing || document.hidden) {
     $("previewLabel").classList.remove("live");
     schedulePreview(400);
@@ -793,7 +913,7 @@ function previewTick() {
     });
 }
 $("previewOn").onchange = () => { $("previewPane").classList.toggle("hidden", !$("previewOn").checked); store.set("preview", $("previewOn").checked ? "1" : "0"); resize(); schedulePreview(0); };
-document.addEventListener("visibilitychange", () => { if (!document.hidden) schedulePreview(0); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { schedulePreview(0); scheduleRaw(0); } });
 
 /* ---------------- connection ----------------
    The editor keeps itself connected: it retries every 3 s until OBS answers,
@@ -802,6 +922,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) sche
 obs.onevent = onObsEvent;
 async function afterConnect() {
   try {
+    rawApi = null; updateLiveUi(); // the plugin on this OBS may differ
     await restoreInterruptedGrab();
     // After a reconnect, re-grab even if the same source is picked again.
     const pref = target || preferred;
@@ -869,12 +990,15 @@ for (const id of ["host", "port", "password"])
   const src = q.get("source") || store.get("source", "");
   if (src) preferred = { source: src, filter: q.get("filter") || (q.get("source") ? "" : store.get("filter", "")) };
   $("previewOn").checked = store.get("preview", "1") === "1";
+  $("liveOn").checked = store.get("live", "1") === "1";
+  updateLiveUi();
   $("previewPane").classList.toggle("hidden", !$("previewOn").checked);
   new ResizeObserver(resize).observe($("stage"));
   new ResizeObserver(resize).observe(cv);
   window.addEventListener("resize", resize);
   resize();
   schedulePreview(500);
+  scheduleRaw(600);
   connect();
 })();
 </script>

@@ -11,6 +11,7 @@
 #include <obs-module.h>
 #include <util/dstr.h>
 #include <util/platform.h>
+#include <stdatomic.h> /* not util/threading.h: it needs MSVC intrinsics on Windows */
 
 #include <math.h>
 #include <stdio.h>
@@ -70,6 +71,18 @@ struct handcam_pin {
 	double corners[NUM_COORDS]; /* last valid corners */
 	float h[9];                 /* row-major 3x3, unit square -> source uv */
 	double aspect;              /* output width/height; 0 = same as the camera */
+
+	/* Copy of our input for the editor's raw view (see "Raw frame for the
+	 * editor" below). Only touched while holding the graphics context. */
+	gs_texrender_t *raw_tex;
+	gs_stagesurf_t *raw_stage;
+	uint32_t raw_max;       /* wanted longest side in pixels, 0 = full size */
+	bool raw_want;          /* capture during the next render */
+	bool raw_done;          /* raw_stage holds a fresh capture */
+	uint32_t raw_w, raw_h;  /* size of that capture */
+	uint32_t raw_sw, raw_sh; /* size of the input it was scaled from */
+	atomic_bool raw_signal; /* set by hp_render after a capture */
+	atomic_bool raw_busy;   /* a vendor request is using the fields above */
 };
 
 /* ------------------------------------------------------------------------ */
@@ -294,11 +307,14 @@ static void hp_destroy(void *data)
 {
 	struct handcam_pin *f = data;
 
-	if (f->effect) {
-		obs_enter_graphics();
+	obs_enter_graphics();
+	if (f->effect)
 		gs_effect_destroy(f->effect);
-		obs_leave_graphics();
-	}
+	if (f->raw_tex)
+		gs_texrender_destroy(f->raw_tex);
+	if (f->raw_stage)
+		gs_stagesurface_destroy(f->raw_stage);
+	obs_leave_graphics();
 	bfree(f);
 }
 
@@ -316,10 +332,70 @@ static uint32_t hp_get_height(void *data)
 	return h;
 }
 
+/*
+ * Render our input (the source, plus any filters before us) scaled down into
+ * raw_tex and queue a GPU->CPU copy. obs_source_skip_video_filter() draws the
+ * same input libobs hands us, without our warp.
+ */
+static void capture_raw_input(struct handcam_pin *f)
+{
+	f->raw_want = false;
+
+	obs_source_t *target = obs_filter_get_target(f->source);
+	uint32_t sw = target ? obs_source_get_base_width(target) : 0;
+	uint32_t sh = target ? obs_source_get_base_height(target) : 0;
+	if (!sw || !sh)
+		return;
+
+	uint32_t cw = sw, ch = sh, longest = sw > sh ? sw : sh;
+	if (f->raw_max && longest > f->raw_max) {
+		double s = (double)f->raw_max / (double)longest;
+		cw = (uint32_t)fmax(1.0, round(sw * s));
+		ch = (uint32_t)fmax(1.0, round(sh * s));
+	}
+
+	if (f->raw_stage &&
+	    (gs_stagesurface_get_width(f->raw_stage) != cw || gs_stagesurface_get_height(f->raw_stage) != ch)) {
+		gs_stagesurface_destroy(f->raw_stage);
+		f->raw_stage = NULL;
+	}
+	if (!f->raw_stage)
+		f->raw_stage = gs_stagesurface_create(cw, ch, GS_RGBA);
+	if (!f->raw_tex)
+		f->raw_tex = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	if (!f->raw_stage || !f->raw_tex)
+		return;
+
+	gs_texrender_reset(f->raw_tex);
+	if (!gs_texrender_begin(f->raw_tex, cw, ch))
+		return;
+	struct vec4 clear;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+	obs_source_skip_video_filter(f->source); /* draws exactly our input */
+	gs_blend_state_pop();
+	gs_texrender_end(f->raw_tex);
+
+	gs_stage_texture(f->raw_stage, gs_texrender_get_texture(f->raw_tex));
+	f->raw_w = cw;
+	f->raw_h = ch;
+	f->raw_sw = sw;
+	f->raw_sh = sh;
+	f->raw_done = true;
+}
+
 static void hp_render(void *data, gs_effect_t *unused)
 {
 	struct handcam_pin *f = data;
 	UNUSED_PARAMETER(unused);
+
+	if (f->raw_want) {
+		capture_raw_input(f);
+		atomic_store(&f->raw_signal, true);
+	}
 
 	uint32_t w, h;
 	output_size(f, &w, &h);
@@ -656,6 +732,259 @@ static obs_properties_t *hp_properties(void *data)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Raw frame for the editor                                                 */
+/*
+ * The editor needs our *input* (camera before the warp) to place corners on.
+ * obs-websocket can only screenshot a source with all its filters applied, so
+ * we answer an obs-websocket vendor request instead:
+ *
+ *   CallVendorRequest { vendorName: "handcam-pin", requestType: "GetRawFrame",
+ *                       requestData: { source, filter, max_size } }
+ *   -> { image: "data:image/bmp;base64,...", width, height,
+ *        source_width, source_height }   or   { error: "..." }
+ *
+ * The handler arms a capture and waits for OBS's next render of the source,
+ * in which hp_render copies its input. (Rendering the source ourselves only
+ * works when OBS isn't drawing it: filters after ours would just redraw their
+ * cached texture for this frame and never reach hp_render.) If nothing draws
+ * the source within a few frames, the handler renders it itself, the way
+ * GetSourceScreenshot does. The copy is read back a frame later so OBS never
+ * waits on the GPU for it. The filter is never switched off, so the stream
+ * doesn't flicker and the editor can poll this for a live view.
+ */
+#define VENDOR_NAME "handcam-pin"
+
+/* Mirrors obs-websocket's lib/obs-websocket-api.h (copied by obs-websocket). */
+struct ws_request_callback {
+	void (*callback)(obs_data_t *request, obs_data_t *response, void *priv);
+	void *priv;
+};
+
+static void put_le16(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+	put_le16(p, v);
+	put_le16(p + 2, v >> 16);
+}
+
+/* Tightly packed RGBA -> 24-bit top-down BMP as a data: URL (bfree it).
+ * Browsers decode BMP natively, and it costs nothing to encode. */
+static char *rgba_to_bmp_url(const uint8_t *rgba, uint32_t w, uint32_t h)
+{
+	static const char prefix[] = "data:image/bmp;base64,";
+	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	const size_t row = ((size_t)w * 3 + 3) & ~(size_t)3;
+	const size_t size = 54 + row * h;
+
+	uint8_t *bmp = bzalloc(size);
+	bmp[0] = 'B';
+	bmp[1] = 'M';
+	put_le32(bmp + 2, (uint32_t)size);
+	put_le32(bmp + 10, 54);                  /* pixel data offset */
+	put_le32(bmp + 14, 40);                  /* BITMAPINFOHEADER */
+	put_le32(bmp + 18, w);
+	put_le32(bmp + 22, (uint32_t)-(int32_t)h); /* negative: rows top-down */
+	put_le16(bmp + 26, 1);                   /* planes */
+	put_le16(bmp + 28, 24);                  /* bits per pixel */
+	put_le32(bmp + 34, (uint32_t)(row * h));
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *s = rgba + (size_t)y * w * 4;
+		uint8_t *d = bmp + 54 + (size_t)y * row;
+		for (uint32_t x = 0; x < w; x++, s += 4, d += 3) {
+			d[0] = s[2];
+			d[1] = s[1];
+			d[2] = s[0];
+		}
+	}
+
+	char *url = bmalloc(sizeof(prefix) - 1 + (size + 2) / 3 * 4 + 1);
+	memcpy(url, prefix, sizeof(prefix) - 1);
+	char *o = url + sizeof(prefix) - 1;
+	size_t i = 0;
+	for (; i + 2 < size; i += 3) {
+		uint32_t v = (uint32_t)bmp[i] << 16 | (uint32_t)bmp[i + 1] << 8 | bmp[i + 2];
+		*o++ = b64[v >> 18];
+		*o++ = b64[(v >> 12) & 63];
+		*o++ = b64[(v >> 6) & 63];
+		*o++ = b64[v & 63];
+	}
+	if (i < size) {
+		uint32_t v = (uint32_t)bmp[i] << 16 | (i + 1 < size ? (uint32_t)bmp[i + 1] << 8 : 0);
+		*o++ = b64[v >> 18];
+		*o++ = b64[(v >> 12) & 63];
+		*o++ = i + 1 < size ? b64[(v >> 6) & 63] : '=';
+		*o++ = '=';
+	}
+	*o = '\0';
+	bfree(bmp);
+	return url;
+}
+
+/* One request per filter at a time (two editors, or overlapping polls). */
+static bool claim_raw(struct handcam_pin *f)
+{
+	for (int i = 0; i < 1000; i++) {
+		if (!atomic_exchange(&f->raw_busy, true))
+			return true;
+		os_sleep_ms(2);
+	}
+	return false;
+}
+
+/* Wait until hp_render has done the armed capture, or the timeout passes. */
+static bool wait_for_capture(struct handcam_pin *f, uint32_t timeout_ms)
+{
+	uint64_t end = os_gettime_ns() + (uint64_t)timeout_ms * 1000000;
+	while (!atomic_load(&f->raw_signal)) {
+		if (os_gettime_ns() >= end)
+			return false;
+		os_sleep_ms(1);
+	}
+	return true;
+}
+
+static void vendor_get_raw_frame(obs_data_t *request, obs_data_t *response, void *priv)
+{
+	UNUSED_PARAMETER(priv);
+	const char *error = NULL;
+	uint8_t *pixels = NULL;
+	uint32_t w = 0, h = 0, sw = 0, sh = 0;
+
+	obs_source_t *source = obs_get_source_by_name(obs_data_get_string(request, "source"));
+	obs_source_t *filter = source ? obs_source_get_filter_by_name(source, obs_data_get_string(request, "filter"))
+				      : NULL;
+	struct handcam_pin *f = NULL;
+	if (filter && strcmp(obs_source_get_unversioned_id(filter), FILTER_ID) == 0)
+		f = obs_obj_get_data(filter);
+
+	long long max = obs_data_get_int(request, "max_size");
+	uint32_t ow = source ? obs_source_get_width(source) : 0;
+	uint32_t oh = source ? obs_source_get_height(source) : 0;
+
+	if (!source) {
+		error = "No source by that name.";
+	} else if (!f) {
+		error = "That source has no Handcam Pin filter by that name.";
+	} else if (!obs_source_enabled(filter)) {
+		error = "The Handcam Pin filter is switched off.";
+	} else if (!ow || !oh) {
+		error = "The source has no video yet.";
+	} else if (!claim_raw(f)) {
+		error = "Busy with another request, try again.";
+	} else {
+		uint32_t frame_ms = (uint32_t)(obs_get_frame_interval_ns() / 1000000) + 1;
+
+		/* Arm the capture and let OBS's own render of this frame do it. */
+		atomic_store(&f->raw_signal, false);
+		obs_enter_graphics();
+		f->raw_max = max <= 0 ? 0 : (uint32_t)(max < 64 ? 64 : max > 8192 ? 8192 : max);
+		f->raw_done = false;
+		f->raw_want = true;
+		obs_leave_graphics();
+
+		if (!wait_for_capture(f, 3 * frame_ms)) {
+			/* Nothing is drawing the source (not in any visible scene), so
+			 * the cached filter textures are stale anyway: render it
+			 * ourselves. Only our capture matters; the image goes to 2x2 px. */
+			obs_enter_graphics();
+			if (f->raw_want) {
+				gs_texrender_t *sink = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+				if (sink && gs_texrender_begin(sink, 2, 2)) {
+					gs_ortho(0.0f, (float)ow, 0.0f, (float)oh, -100.0f, 100.0f);
+					obs_source_video_render(source);
+					gs_texrender_end(sink);
+				}
+				if (sink)
+					gs_texrender_destroy(sink);
+				gs_flush();
+			}
+			obs_leave_graphics();
+		}
+
+		/* Map a frame later, so the GPU has finished the copy by then and
+		 * mapping doesn't stall OBS's render thread waiting for it. */
+		os_sleep_ms(frame_ms);
+
+		obs_enter_graphics();
+		f->raw_want = false;
+		uint8_t *data;
+		uint32_t linesize;
+		if (f->raw_done && gs_stagesurface_map(f->raw_stage, &data, &linesize)) {
+			w = f->raw_w;
+			h = f->raw_h;
+			sw = f->raw_sw;
+			sh = f->raw_sh;
+			pixels = bmalloc((size_t)w * h * 4);
+			for (uint32_t y = 0; y < h; y++)
+				memcpy(pixels + (size_t)y * w * 4, data + (size_t)y * linesize, (size_t)w * 4);
+			gs_stagesurface_unmap(f->raw_stage);
+		}
+		f->raw_done = false;
+		obs_leave_graphics();
+		atomic_store(&f->raw_busy, false);
+
+		if (!pixels)
+			error = "Could not capture the camera image.";
+	}
+
+	if (pixels) {
+		char *url = rgba_to_bmp_url(pixels, w, h);
+		obs_data_set_string(response, "image", url);
+		obs_data_set_int(response, "width", w);
+		obs_data_set_int(response, "height", h);
+		obs_data_set_int(response, "source_width", sw);
+		obs_data_set_int(response, "source_height", sh);
+		bfree(url);
+		bfree(pixels);
+	} else {
+		obs_data_set_string(response, "error", error);
+	}
+	obs_source_release(filter);
+	obs_source_release(source);
+}
+
+/* Register GetRawFrame with obs-websocket (in post_load, as its API requires).
+ * Never unregistered: obs-websocket drops vendors itself when it unloads, and
+ * at our unload it may already be gone. */
+static void register_vendor_requests(void)
+{
+	calldata_t cd = {0};
+	proc_handler_t *ws = NULL;
+	if (proc_handler_call(obs_get_proc_handler(), "obs_websocket_api_get_ph", &cd))
+		ws = calldata_ptr(&cd, "ph");
+	calldata_free(&cd);
+	if (!ws) {
+		blog(LOG_INFO, LOG_PREFIX "obs-websocket not found; the editor's live raw view is unavailable");
+		return;
+	}
+
+	cd = (calldata_t){0};
+	calldata_set_string(&cd, "name", VENDOR_NAME);
+	proc_handler_call(ws, "vendor_register", &cd);
+	void *vendor = calldata_ptr(&cd, "vendor");
+	calldata_free(&cd);
+
+	bool ok = false;
+	if (vendor) {
+		struct ws_request_callback cb = {vendor_get_raw_frame, NULL};
+		cd = (calldata_t){0};
+		calldata_set_ptr(&cd, "vendor", vendor);
+		calldata_set_string(&cd, "type", "GetRawFrame");
+		calldata_set_ptr(&cd, "callback", &cb);
+		proc_handler_call(ws, "vendor_request_register", &cd);
+		ok = calldata_bool(&cd, "success");
+		calldata_free(&cd);
+	}
+	if (!ok)
+		blog(LOG_WARNING, LOG_PREFIX "could not register obs-websocket vendor request");
+}
+
+/* ------------------------------------------------------------------------ */
 
 static struct obs_source_info handcam_pin_filter = {
 	.id = FILTER_ID,
@@ -686,6 +1015,7 @@ void obs_module_post_load(void)
 	char *path = editor_path();
 	editor_url = path ? path_to_file_url(path) : NULL;
 	bfree(path);
+	register_vendor_requests();
 }
 
 void obs_module_unload(void)
