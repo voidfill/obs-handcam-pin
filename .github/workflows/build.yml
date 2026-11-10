@@ -47,11 +47,56 @@ jobs:
       - name: Check exported symbols
         run: |
           case "${{ matrix.os }}" in
-            linux)   nm -D --defined-only dist/stage/handcam-pin/bin/64bit/handcam-pin.so | grep obs_module_load >/dev/null ;;
+            linux)   nm -D --defined-only dist/stage/handcam-pin/handcam-pin.so | grep obs_module_load >/dev/null
+                     cmp dist/stage/handcam-pin/handcam-pin.so dist/stage/handcam-pin/bin/64bit/handcam-pin.so ;;
             macos)   nm -gU dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin | grep obs_module_load >/dev/null
                      lipo -info dist/stage/handcam-pin.plugin/Contents/MacOS/handcam-pin ;;
-            windows) grep -q obs_module_load dist/stage/handcam-pin/bin/64bit/handcam-pin.dll ;;
+            windows) grep -q obs_module_load dist/stage/handcam-pin/handcam-pin.dll
+                     cmp dist/stage/handcam-pin/handcam-pin.dll dist/stage/handcam-pin/bin/64bit/handcam-pin.dll ;;
           esac
+
+      # install.ps1 must stay ASCII (PS 5.1's irm decodes it as Latin-1), and no
+      # file may carry stray control characters from a botched edit.
+      - name: Lint install scripts and README
+        if: matrix.os == 'linux'
+        run: |
+          shellcheck -S warning install/install.sh
+          if LC_ALL=C grep -nP '[^\x09\x0A\x20-\x7E]' install/install.ps1 install/install.sh; then
+            echo "install scripts must be pure ASCII" >&2; exit 1
+          fi
+          if LC_ALL=C grep -nP '[\x00-\x08\x0B\x0C\x0E-\x1F]' README.md; then
+            echo "control characters in README.md" >&2; exit 1
+          fi
+
+      # Run the real installers on the zip just built, into a throwaway home /
+      # ProgramData. They print their errors instead of failing, so check the files.
+      - name: Installer smoke test (macOS, Linux)
+        if: matrix.os != 'windows'
+        run: |
+          # The runner's own XDG dirs would point the install outside the throwaway home.
+          unset XDG_CONFIG_HOME XDG_DATA_HOME
+          export HOME="$RUNNER_TEMP/home" HANDCAM_PIN_ZIP="$(ls dist/*.zip)"
+          sh install/install.sh
+          if [ "${{ matrix.os }}" = macos ]; then
+            p="$HOME/Library/Application Support/obs-studio/plugins/handcam-pin.plugin"
+            test -f "$p/Contents/Resources/editor.html"
+            codesign --verify "$p"
+          else
+            p="$HOME/.config/obs-studio/plugins/handcam-pin"
+            test -f "$p/handcam-pin.so" && test -f "$p/bin/64bit/handcam-pin.so" && test -f "$p/data/editor.html"
+          fi
+
+      - name: Installer smoke test (Windows PowerShell 5.1)
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $env:ProgramData = "$env:RUNNER_TEMP\pd"
+          $env:HANDCAM_PIN_ZIP = (Resolve-Path dist\*.zip).Path
+          Get-Content install\install.ps1 -Raw | Invoke-Expression
+          $p = "$env:ProgramData\obs-studio\plugins\handcam-pin"
+          foreach ($f in 'handcam-pin.dll', 'bin\64bit\handcam-pin.dll', 'data\editor.html', 'data\handcam-pin.effect') {
+            if (-not (Test-Path (Join-Path $p $f))) { Write-Error "missing $f"; exit 1 }
+          }
 
       - uses: actions/upload-artifact@v7
         with:
@@ -66,11 +111,29 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      # The one-liners fetch releases/latest/download/install.*, which then
+      # download this release's zip and check it against the hash baked in here.
+      - name: Installer scripts
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          for os in windows linux macos; do
+            h=$(sha256sum "dist/handcam-pin-$v-$os.zip" | cut -d' ' -f1)   # fails if the zip is missing
+            [[ "$h" =~ ^[0-9a-f]{64}$ ]] || { echo "bad hash for $os: $h" >&2; exit 1; }
+            declare "sha_$os=$h"
+          done
+          sed -e "s|@VERSION@|$v|" -e "s|@REPO@|$GITHUB_REPOSITORY|" -e "s|@SHA256@|$sha_windows|" \
+            install/install.ps1 > dist/install.ps1
+          sed -e "s|@VERSION@|$v|" -e "s|@REPO@|$GITHUB_REPOSITORY|" \
+            -e "s|@SHA256_LINUX@|$sha_linux|" -e "s|@SHA256_MACOS@|$sha_macos|" \
+            install/install.sh > dist/install.sh
+          if grep -n "'@[A-Z0-9_]*@'" dist/install.ps1 dist/install.sh; then echo "unfilled placeholder" >&2; exit 1; fi
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/install.ps1 dist/install.sh --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)

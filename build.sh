@@ -33,6 +33,19 @@ CFLAGS=(-std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-init
         -Ivendor/libobs "-DPLUGIN_VERSION=\"$VERSION\"")
 DATA_FILES=(data/handcam-pin.effect data/editor.html data/locale)
 
+# Windows and Linux: one plugin folder that both OBS plugin layouts accept.
+#   <name>/<name>.dll|.so          OBS 33+ ("plugins/<module>/<module>.dll")
+#   <name>/bin/64bit/<name>.*      OBS 31-32 (OBS 33 still loads it as "legacy")
+#   <name>/data/                   both
+# OBS 33 loads the new layout first and skips the legacy copy as already loaded,
+# so the binary is shipped twice on purpose.
+stage_dual_layout() {
+  mkdir -p "$PKG/bin/64bit" "$PKG/data"
+  cp "$1" "$PKG/"
+  cp "$1" "$PKG/bin/64bit/"
+  cp -r "${DATA_FILES[@]}" "$PKG/data/"
+}
+
 case "$(uname -s)" in
 Linux*)   OS=linux ;;
 Darwin*)  OS=macos ;;
@@ -47,9 +60,7 @@ linux)
   "$CC" "${CFLAGS[@]}" -fPIC -fvisibility=hidden -shared -s \
     -o "$BUILD/$NAME.so" "src/$NAME.c" -lm
   STAGE="$DIST/stage"; PKG="$STAGE/$NAME"
-  mkdir -p "$PKG/bin/64bit" "$PKG/data"
-  cp "$BUILD/$NAME.so" "$PKG/bin/64bit/"
-  cp -r "${DATA_FILES[@]}" "$PKG/data/"
+  stage_dual_layout "$BUILD/$NAME.so"
   ;;
 macos)
   CC="${CC:-clang}"
@@ -70,11 +81,9 @@ windows)
   "$ZIG" dlltool -m i386:x86-64 -d windows/obs.def -l "$BUILD/obs.lib"
   "$ZIG" cc -target x86_64-windows-gnu "${CFLAGS[@]}" -shared -s \
     -o "$BUILD/$NAME.dll" "src/$NAME.c" "$BUILD/obs.lib" -lshell32
-  # Same layout as Linux: goes into C:\ProgramData\obs-studio\plugins (no admin, OBS 30+).
+  # Same layout as Linux: goes into C:\ProgramData\obs-studio\plugins (no admin).
   STAGE="$DIST/stage"; PKG="$STAGE/$NAME"
-  mkdir -p "$PKG/bin/64bit" "$PKG/data"
-  cp "$BUILD/$NAME.dll" "$PKG/bin/64bit/"
-  cp -r "${DATA_FILES[@]}" "$PKG/data/"
+  stage_dual_layout "$BUILD/$NAME.dll"
   ;;
 esac
 echo "Built $NAME $VERSION ($OS) -> $STAGE/"
@@ -92,9 +101,13 @@ package)
   echo "Packaged $DIST/$ZIPNAME"
   ;;
 install)
-  # No-admin plugin folders that OBS 30+ scans.
+  # No-admin plugin folders that OBS 31+ scans.
   case "$OS" in
-  linux)   DEST="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"; ITEM="$NAME" ;;
+  linux)   DEST="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"; ITEM="$NAME"
+           # OBS 33 prefers ~/.local/share (where install.sh puts it for OBS 33), so a
+           # copy there would shadow this dev build.
+           NEWER="${XDG_DATA_HOME:-$HOME/.local/share}/obs-studio/plugins/$NAME"
+           if [ -e "$NEWER" ]; then rm -rf "$NEWER"; echo "Removed $NEWER so OBS loads this build"; fi ;;
   macos)   DEST="$HOME/Library/Application Support/obs-studio/plugins"; ITEM="$NAME.plugin" ;;
   windows) DEST="$(cygpath -u "${PROGRAMDATA:-C:\\ProgramData}")/obs-studio/plugins"; ITEM="$NAME"
            # Windows locks the DLL while OBS runs; bail out before deleting anything.
