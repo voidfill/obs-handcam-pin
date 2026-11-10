@@ -22,56 +22,90 @@ output.
 
 ## Install
 
-Download the zip for your OS from the [Releases](../../releases) page.
-
 ### Windows
 
-Right-click the zip → *Extract All…* and type `C:\ProgramData\obs-studio\plugins` as
-the destination. Windows creates any missing folders, and no admin rights are needed.
-(`ProgramData` is hidden in Explorer, but typing the path works.) You should end up with:
+Open PowerShell (press Start, type `PowerShell`, press Enter), paste this line and
+press Enter:
+
+```powershell
+irm https://github.com/voidfill/obs-handcam-pin/releases/latest/download/install.ps1 | iex
+```
+
+(In Command Prompt instead, run
+`powershell -c "irm https://github.com/voidfill/obs-handcam-pin/releases/latest/download/install.ps1 | iex"`.)
+
+It downloads the latest release, checks its checksum and installs it into
+`C:\ProgramData\obs-studio\plugins\handcam-pin`. That folder works for every
+OBS 31+ install: the installer from obsproject.com, Steam, winget and so on. If OBS
+is open, it waits for you to close it. If an old copy of the plugin is in OBS's own
+program folder (for example from copying files there by hand), it removes that copy,
+which may need one admin prompt. You can [read the script](install/install.ps1) first.
+
+### macOS and Linux
+
+Paste this into a terminal:
+
+```bash
+curl -fsSL https://github.com/voidfill/obs-handcam-pin/releases/latest/download/install.sh | sh
+```
+
+It installs into your own OBS plugin folder, with no `sudo`. On Linux it finds the
+regular, Flatpak and Snap OBS and uses the folder that version loads from. On
+macOS, files downloaded with `curl` aren't quarantined, so Gatekeeper doesn't
+complain. You can [read the script](install/install.sh) first.
+
+Then start OBS and continue with [Usage](#usage). In the OBS log you should see
+`[handcam-pin] loaded version …`.
+
+**Updating:** run the same command again. Your corners and shape are stored in
+your OBS scene collection, so they're kept. **Uninstalling:** delete the folder the
+installer printed.
+
+<details><summary>Manual install from the zip</summary>
+
+Download the zip for your OS from the [Releases](../../releases) page and close OBS.
+
+**Windows:** right-click the zip → *Extract All…* and type `C:\ProgramData\obs-studio\plugins`
+as the destination. Windows creates any missing folders, and no admin rights are
+needed. (`ProgramData` is hidden in Explorer, but typing the path works.) You should
+end up with:
 
 ```
-C:\ProgramData\obs-studio\plugins\handcam-pin\bin\64bit\handcam-pin.dll
+C:\ProgramData\obs-studio\plugins\handcam-pin\handcam-pin.dll            ← loaded by OBS 33+
+C:\ProgramData\obs-studio\plugins\handcam-pin\bin\64bit\handcam-pin.dll  ← loaded by OBS 31–32
 C:\ProgramData\obs-studio\plugins\handcam-pin\data\
 ```
 
-<details><summary>Portable OBS, or prefer the OBS install folder?</summary>
+The DLL is in there twice on purpose, so the same folder works with every OBS
+version. Don't also copy it into OBS's program folder (for Steam,
+`steamapps\common\OBS Studio`). OBS doesn't need it there, and an old copy there can
+be loaded instead of a newer one.
 
-Portable OBS may only look in its own folder. Copy the files there instead (this
-needs admin rights for `C:\Program Files`):
+**Portable OBS** ignores `ProgramData`. For OBS 33+, copy the whole `handcam-pin`
+folder to `<OBS folder>\plugins\`. For OBS 31–32, use the old layout (this needs
+admin rights under `C:\Program Files`):
 
 ```
 <OBS folder>\obs-plugins\64bit\handcam-pin.dll        ← from handcam-pin\bin\64bit\
 <OBS folder>\data\obs-plugins\handcam-pin\            ← contents of handcam-pin\data\
 ```
-</details>
 
-### Linux
+**Linux:** extract the zip into `~/.local/share/obs-studio/plugins/` for OBS 33+, or
+`~/.config/obs-studio/plugins/` for OBS 31–32. For the Flatpak, use
+`~/.var/app/com.obsproject.Studio/data/obs-studio/plugins/` (33+) or
+`~/.var/app/com.obsproject.Studio/config/obs-studio/plugins/` (31–32). For the Snap,
+use `~/snap/obs-studio/current/.local/share/obs-studio/plugins/` (33+) or
+`~/snap/obs-studio/common/.config/obs-studio/plugins/` (31–32). Keep only one copy:
+OBS 33 prefers the first location.
 
-Extract the zip into `~/.config/obs-studio/plugins/`:
-
-```
-~/.config/obs-studio/plugins/handcam-pin/bin/64bit/handcam-pin.so
-~/.config/obs-studio/plugins/handcam-pin/data/
-```
-
-For the Flatpak version of OBS, use `~/.var/app/com.obsproject.Studio/config/obs-studio/plugins/` instead.
-
-### macOS
-
-Copy `handcam-pin.plugin` into `~/Library/Application Support/obs-studio/plugins/`.
-The bundle is ad-hoc signed, not notarized. If macOS refuses to load it, run:
+**macOS:** copy `handcam-pin.plugin` into `~/Library/Application Support/obs-studio/plugins/`.
+The bundle is ad-hoc signed, not notarized. If you downloaded it in a browser and
+macOS refuses to load it, run:
 
 ```bash
 xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/handcam-pin.plugin
 ```
-
-Restart OBS after installing. In the log you should see `[handcam-pin] loaded version …`.
-
-**Updating:** close OBS, delete the old `handcam-pin` folder (`handcam-pin.plugin`
-on macOS), extract the new one in its place, and start OBS. Your corners and shape
-are stored in your OBS scene collection, so they're kept. **Uninstalling:** delete
-that folder.
+</details>
 
 ## Usage
 
@@ -167,7 +201,10 @@ release, change `OBS_VERSION`; the next build fetches the matching headers.
 | Windows | [Zig](https://ziglang.org) 0.15+, Git Bash | `zig dlltool` makes `obs.lib` from `windows/obs.def`. If you call a new libobs function, add it there |
 
 CI (`.github/workflows/build.yml`) builds on native Linux, Windows and macOS runners.
-Pushing a `v*` tag publishes a GitHub release with the three zips.
+Pushing a `v*` tag publishes a GitHub release with the three zips and the two
+install scripts from [`install/`](install), with that release's version and zip
+checksums filled in. Both scripts also install a local zip if you set
+`HANDCAM_PIN_ZIP` to its path, which is how CI tests them.
 
 ## Notes
 
